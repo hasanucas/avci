@@ -1,13 +1,13 @@
-# AVCI — Orin yazılımı (tek repo)
+# AVCI — Orin + laptop yazılımı (tek repo)
 
-HUNTER'ın Orin tarafı ve tiled tracker tek repoda. Yeni bir Orin'e **tek komutla** kurulur, çalışan Orin'de her şey eskisi gibi çalışır.
+HUNTER'ın Orin tarafı, tiled tracker ve laptop tarafı (`avci_follow`) tek repoda. Yeni bir Orin'e **tek komutla** kurulur, çalışan Orin'de her şey eskisi gibi çalışır.
 
 | Klasör | Ne | Ayrıntı |
 |---|---|---|
 | `hunter-orin/` | HUNTER — otonom FPV önleme. KCF / ORTrack tracker (C++, TensorRT, RTSP giriş/çıkış, OSD), MAVLink, GUIDED_NOGPS kontrolcü (`controller_guided.py`, `guided_sender.py`) ve teacher'lar (`hc_air*.py`) | `hunter-orin/README.md` |
 | `orin-tiled-tracker/` | Modelden bağımsız döşemeli (tiled) tespit + takip, TensorRT, hedef 25 FPS (ekmek sayma, araç tespiti). Model: `UAV-YOLOv11m.pt` | `orin-tiled-tracker/README_KURULUM.md` |
 | `setup/` | Kurulum ve kontrol scriptleri + çalışan ortamın kaydı (`referans_ortam/`) | aşağıda |
-| `avci_follow/` | *(sonra eklenecek)* laptop tarafı — GPS takip / relay | — |
+| `avci_follow/` | **Laptop (Windows)** tarafı — GPS'li takip / relay: telemetri radyolarıyla takipçi drone'a GUIDED hedef (`follow_gps.py`, `fpv_gate_il/trajectory/`) | `avci_follow/README.md` |
 
 ---
 
@@ -59,6 +59,35 @@ nmcli con show              # eno1'de TEK profil kalsın; diğerini: sudo nmcli 
 | 9 | `setup/kontrol.sh` |
 
 Python paket sürümleri `setup/referans_ortam/pip_user.txt`'ten (çalışan Orin'in kaydı) sabitlenir.
+
+---
+
+## Laptop (Windows) — avci_follow
+
+Orin kurulumu gerekmez; sadece Python + telemetri radyosu. PowerShell'de:
+
+**1. Git + SSH anahtarı** (laptop'un kendi anahtarı):
+```powershell
+ssh-keygen -t ed25519 -C "laptop"               # 3 kez Enter
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub  # GitHub > Settings > SSH and GPG keys > New SSH key
+ssh -T git@github.com                           # "Hi hasanucas!"
+cd $env:USERPROFILE\Desktop
+git clone git@github.com:hasanucas/avci.git
+```
+
+**2. Python:** python.org'dan kur ("Add python.exe to PATH" işaretli). Microsoft Store sürümünü kullanma. Temel paketler: `pip install pymavlink pyserial`; gerisi ve çalıştırma: `avci_follow/README.md`.
+
+**3. Telemetri radyosu (SiK / CP2102):** Aygıt Yöneticisi'nde COM portu yoksa Silicon Labs **CP210x VCP** sürücüsü gerekir. Kontrol: `python -m serial.tools.list_ports -v`. Mission Planner açıksa kapat — aynı COM portunu iki program açamaz.
+
+**Laptopta günlük git** (Windows PowerShell 5.1'de `&&` yok, komutlar ayrı satırda):
+```powershell
+cd $env:USERPROFILE\Desktop\avci
+git pull                      # işe başlamadan önce
+git add -A
+git commit -m "follow: ne değişti"
+git push
+```
+Kod artık `Desktop\avci\avci_follow` içinde; eski `Desktop\avci_follow1` eski bir kopya, repoda yok.
 
 ---
 
@@ -159,7 +188,7 @@ mv _repo_yedek/<tarih>/hunter-orin/.git hunter-orin/      # eski git geçmişi g
 ## Yapılacaklar
 
 - [ ] FC özel firmware (`.apj`) + doğrulanmış param dosyası → `hunter-orin/fc/`
-- [ ] `avci_follow/` (laptop) eklenecek
+- [x] `avci_follow/` (laptop) eklendi
 - [ ] `hunter-orin/README.md` güncel mimariye göre (GUIDED_NOGPS, teacher'lar, EKF source switch, GPS fazı)
 
 ## Geçmiş
