@@ -98,7 +98,7 @@ TensorRT planı GPU mimarisine + TRT sürümüne + sürücüye bağlıdır.
 
 ```bash
 cd ~/Desktop/hunter-orin
-sudo nvpmodel -m 0 && sudo jetson_clocks
+sudo nvpmodel -m 2 && sudo jetson_clocks
 ./scripts/build_ortrack_engine.sh     # ~90-150 sn, beklenen ~7 ms
 ./scripts/build_yolo_engine.sh        # ~12 dk sürer, ölçülen 26 ms
 ```

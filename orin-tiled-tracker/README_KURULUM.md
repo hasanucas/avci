@@ -21,7 +21,7 @@ Hedef: 1080p girişte 25 FPS (alt limit 20).
 ## Kurulum (Orin Nano, JetPack 6.2.x)
 ```bash
 # 1) Güç modu (her boot sonrası ya da rc.local'e ekleyin)
-sudo nvpmodel -m 0 && sudo jetson_clocks
+sudo nvpmodel -m 2 && sudo jetson_clocks
 
 # 2) PyTorch: NVIDIA'nın JetPack-6 wheel'i (pip'ten DEĞİL)
 #    https://developer.nvidia.com/embedded/downloads -> PyTorch for Jetson
