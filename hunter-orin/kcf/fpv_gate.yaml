@@ -1,0 +1,307 @@
+# fpv-gate-il unified runtime config.
+# Obs/action contract (camera_bridge + teachers + BC/RL) + HCAir parameters.
+
+image:
+  width: 1280
+  height: 720
+  hfov_deg: 80.0
+  # Gimbal neutral mount pitch (obs[12] / camera_pitch_deg).
+  # Sign: positive = depression (down), negative = up. -15 = 15 deg up.
+  pitch_deg: -15.0
+
+observation:
+  vision:
+    - bbox_cx
+    - bbox_cy
+    - bbox_w
+    - bbox_h
+    - angular_x_deg
+    - angular_y_deg
+  attitude:
+    - roll_deg
+    - pitch_deg
+    - yaw_deg
+    - roll_rate_dps
+    - pitch_rate_dps
+    - yaw_rate_dps
+  meta:
+    - camera_pitch_deg
+    - bbox_valid
+
+action:
+  - roll_cmd
+  - pitch_cmd
+  - throttle_cmd
+  - yaw_cmd
+
+dimensions:
+  obs: 14
+  action: 4
+
+bridge:
+  tcp_port: 9999
+  mavlink_port: 14552
+  packet_magic: 0x44524F4E  # "DRON"
+  # iris_runway + iris_with_gimbal (ArduPilot gazebo); find with: gz topic -l | grep camera/image
+  camera_topic: /world/iris_runway/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image
+
+hc_air:
+  # HCAir hard-coded teacher (attitude-hold).
+  # action = [roll_des_deg, pitch_des_deg, thrust, yaw_des_deg].
+  # GPS yok; IMU attitude + baro vz + vision.
+  platform:
+    # Sim / gerçek drone hover collective (0..1). Thrust FF ve tilt comp tabanı.
+    hover_thrust: 0.07
+    # SET_ATTITUDE_TARGET thrust komut alt/üst sınırı (env clip ile aynı olmalı).
+    # Motor map: hover_motor + (action - 0.07) * 0.45 → 0.85 ≈ motor 0.68.
+    # Closure dive / overfly sink: -0.2 motor map'te yetersizdi (est15 thr tabanı).
+    # Erken aşırı alçalma far_sink_cap ile sınırlı; global -0.30 güvenli.
+    thrust_cmd_min: -0.30
+    thrust_cmd_max: 0.30
+    # Privileged (EKF vz) yokken açık çevrim FF thrust çarpanı.
+    ff_open_loop_scale: 1.08
+    # Bank/pitch tilt compensation: cos(tilt) bu değerin altına inmez.
+    tilt_cos_min: 0.5
+
+  action_limits:
+    # Attitude-hold açı tavanları (derece). Env step() clipping ile uyumlu.
+    # Terminal crab 48° kullanabilir; mid soft-cap roll.max_bank_deg.
+    max_bank_deg: 48.0
+    pitch_des_min_deg: -24.0
+    pitch_des_max_deg: 8.0
+    max_yaw_offset_deg: 45.0
+
+  camera:
+    # obs[12] yoksa kullanılan varsayılan gimbal pitch (derece).
+    # üst seviye image.pitch_deg ile aynı tutun (-15 = 15° yukarı mount).
+    pitch_default_deg: -15.0
+    # Eski elev_cam (v_adapt lead); irtifa reticle artık horizon + gate top.
+    axis_offset_deg: 15.0
+    pitch_transfer: 0.85
+    # Horizon reticle: ang_y_top'u pitch_reticle - camera_pitch'e hizala.
+    # Gate TOP (bbox üst kenar) — merkeze değil; biraz üstten yaklaşma.
+    use_gate_top_reticle: true
+    # Gate TOP reticle — drone gate'in ALTINDA olmamalı (yer kapıları da var).
+    # est15 mid: des≈+1.4 wings-level tırmanma → -6.0 (est14'teki -7.5 değil).
+    reticle_elev_bias_deg: -6.0
+
+  yaw:
+    # ang_x deadband (derece); altında yaw offset sıfır.
+    ang_x_deadband_deg: 0.10
+    # Yatay nişan: ang_x (deg) → yaw offset (deg) relative to measured yaw.
+    kp_offset_deg_per_deg: 2.5
+    # Yaw offset satürasyonu (deg).
+    max_offset_deg: 45.0
+
+  pitch_attitude:
+    # Closure governor hedef pitch (derece, negatif = burun aşağı).
+    cruise_des_deg: -7.5
+    des_min_deg: -24.0
+    des_max_deg: 8.0
+    # vz fazla yüksekken pitch tavanını gevşet (climb assist).
+    assist_climb_err_mps: 1.5
+    # Sink excess (vz_des - vz_up) üstünde pitch tabanını gevşet.
+    assist_sink_err_mps: 1.0
+    assist_k_deg_per_mps: 3.0
+    assist_max_deg: 8.0
+    # Sink assist aktifken pitch taban sınırı (daha az agresif dive).
+    des_min_relaxed_deg: -10.0
+    # EKF yokken sabit pitch hedefi (derece).
+    fallback_des_deg: -6.0
+
+  # Pitch↔thrust irtifa koruması: aşırı dive + thrust tavanı → sink/crash.
+  altitude_protect:
+    # vz_up, vz_des'ten bu kadar (m/s) daha negatifse (aşırı sink) protect.
+    # Komut edilen alçalmayı engellemez (est8/9 üzerinden uçuş fix).
+    sink_mps: 0.8
+    # Thrust satürasyonu: prev thrust >= frac * thrust_max ve vz hedefinin altında.
+    thrust_sat_frac: 0.90
+    thrust_sat_vz_margin_mps: 0.25
+    # Alt protect aktifken burun-yukarı bleed (deg/s).
+    bleed_deg_s: 14.0
+    # Thrust sat + aşırı sink iken pitch tabanı en az cruise.
+    sat_pitch_floor_cruise: true
+
+  pitch_governor:
+    # Filtrelenmiş bbox closure hedefi (1/s, pozitif = yaklaşma).
+    closure_target_per_s: 0.05
+    closure_filt_alpha: 0.08
+    # Closure hatasına göre pitch_des ramp (deg/s per closure unit).
+    ramp_up_deg_s_per_unit: 12.0
+    ramp_down_deg_s_per_unit: 4.0
+    # pitch_des değişim hız tavanı (deg/s).
+    des_accel_max_deg_s: 9.0
+    # Track lock sonrası governor devreye girmeden bekleme (s).
+    warmup_s: 2.0
+    # Governor gate: max |ang_x| (deg) normal / receding mod.
+    aim_max_deg: 3.0
+    chase_aim_max_deg: 10.0
+    # Governor gate: |pitch_des - pitch| max (deg).
+    pitch_err_max_deg: 12.0
+    # Governor gate: |vz_des - vz_up| max (m/s) normal / receding.
+    vz_err_max_mps: 3.0
+    chase_vz_err_max_mps: 5.5
+    # closure_filt bu eşiğin altında "receding" (kapı uzaklaşıyor).
+    recede_threshold_per_s: 0.0
+    # Küçük bbox'ta yavaşlama governor'ı devreye girmez (norm. bbox size).
+    no_slowdown_size: 0.03
+    # Bbox kaybı sonrası lock timer sıfırlama eşiği (s).
+    lock_reset_after_s: 0.5
+    # Dikey hata büyükken pitch_des'i cruise'a doğru gevşet (deg/s).
+    vert_brake_deg_s: 1.5
+    # Yakın gate + yatay nişan bozukken pitch_des'i yavaşlat (t_go uzat).
+    # est16: yan eşleşmeden yaklaşınca overfly — daha erken/sert hız kes.
+    # Overfly aktifken KAPALI (nose-up vs sink çatışması).
+    # est18: -4 + pozitif vz_des → 19→31m balon; des≈cruise, hold süresince climb yasak.
+    # est4: elev yüksekken climb=0 → gate 3–4m altında; elev üstünde sınırlı climb.
+    lat_slow_size_ratio: 1.0
+    lat_slow_aim_deg: 0.8
+    lat_slow_des_deg: -6.0
+    lat_slow_deg_s: 14.0
+    lat_slow_climb_elev_deg: 2.0
+    lat_slow_climb_cap_mps: 1.5
+    # Bbox kaybında pitch_des decay başlangıç gecikmesi (s).
+    lost_des_decay_after_s: 2.0
+    lost_des_decay_deg_s: 3.0
+
+  roll:
+    # Crab: filtrelenmiş LOS azimuth rate (deg/s) → bank (deg).
+    # est11: kp/far-scale yüksek → mid-fazda ±40° bank chatter; damping eklendi.
+    kp_crab_bank_deg_per_dps: 2.0
+    # Daha ağır LOS az filtresi (düşük alpha = daha az jitter).
+    los_az_filt_alpha: 0.18
+    # Bbox kaybında LOS az filt decay çarpanı (her adım).
+    los_az_lost_decay: 0.8
+    # |LOS az rate| bu eşiğin (deg/s) altında crab = 0 (bbox jitter).
+    crab_los_deadband_dps: 1.5
+    # Uzak gate: aynı LOS rate ≈ daha büyük yan hız → crab'ı büyüt.
+    # scale = clip(far_ref / size_ratio, 1, far_scale_max) when size < far_ref.
+    crab_far_ref_size_ratio: 1.0
+    crab_far_size_floor: 0.35
+    crab_far_scale_max: 1.8
+    # Yakın gate: chatter'sız crab güçlendir (est13 terminal yan yetişememe).
+    crab_near_size_ratio: 1.0
+    crab_near_scale: 1.8
+    crab_near_deadband_dps: 0.6
+    # Terminal (est1 çapraz 20m/s): size>=2 iken crab/ang_x ekstra — ax blowup öncesi.
+    crab_term_size_ratio: 2.0
+    crab_term_scale: 1.5
+    # Yakın gate: ang_x (deg) → bank (deg).
+    kp_ang_x_bank_deg_per_deg: 4.0
+    # size_ratio bu eşiğin üstünde ang_x bank aktif (erken trim).
+    ang_x_bank_size_ratio: 0.35
+    # Terminal ang_x trim çarpanı (near kp üzerine).
+    ang_x_term_scale: 2.0
+    max_bank_deg: 40.0
+    max_bank_term_deg: 48.0
+    # Overfly + istenmeyen tırmanma: bank'ı azalt (dikey thr bileşeni).
+    # |ang_x| büyükken KAPALI — çapraz kaçışta yan öncelik (est1).
+    overfly_bank_shed_frac: 0.55
+    overfly_bank_shed_climb_mps: 0.5
+    overfly_bank_shed_ax_min_deg: 3.0
+    # Terminal yaw offset çarpanı (crossing catch-up).
+    yaw_term_scale: 1.35
+
+  vertical_thrust:
+    # Dikey hız PI: vz error (m/s) → thrust delta.
+    kp: 0.120
+    ki: 0.040
+    # Cruise irtifa: vz_des = k_pursuit * V * tan(reticle_elev).
+    # reticle_elev = pitch_reticle - camera_pitch - ang_y_top + bias.
+    # pitch_reticle = max(pitch, cruise_des) — hız için burun aşağı irtifayı bozmaz.
+    # Dive fazında irtifa eşleme KAPALI (sadece tilt FF).
+    k_pursuit: 1.8
+    # Referans pursuit hızı (m/s); GPS yok, sabit taban hız.
+    v_pursuit_ref_mps: 15.0
+    vz_int_max: 0.22
+    vz_des_max_mps: 12.0
+    # Uzakta agresif sink yasak (est14: uzakken 37→15m dalış → gate altına).
+    # size_ratio < far_size iken vz_des >= -far_sink_cap.
+    far_sink_size_ratio: 1.0
+    far_sink_cap_mps: 2.0
+    t_fb_max: 0.45
+    # Nose-down (cruise'a göre) için ekstra collective — irtifa kaybını önler.
+    pitch_thrust_gain: 0.028
+    # reticle elev bu eşiğin (deg) altındayken pitch_thrust_gain → 0.
+    sink_ff_fade_elev_deg: -4.0
+    # Bbox kaybında vz_des hold decay tau (s).
+    lost_vz_decay_tau_s: 1.0
+
+  # Overfly: sadece YAKIN + gate kadrajda aşağı (üstünden uçuş).
+  # est14 bug: size_ratio başlangıçta 1.0 → overfly t=0'da ateşlendi.
+  overfly:
+    size_ratio: 2.0
+    elev_deg: -2.0
+    sink_boost: 1.5
+    min_sink_mps: 2.5
+    pitch_bleed_deg_s: 14.0
+    pitch_des_deg: -14.0
+    # Overfly + tırmanma: thr tabanını geçici düşür.
+    thrust_cmd_min: -0.30
+    # Bank tilt-FF thr'yi şişirir (est16 dive'da thr=+0.30) — overfly'da kapat.
+    zero_tilt_ff: true
+    # Overfly girişinde vz PI integral sıfırla.
+    reset_vz_int_on_enter: true
+
+  vertical_adapt:
+    # Elevation lag pozitifken v_adapt artış kazancı (m/s per deg drift).
+    k_per_deg: 10.0
+    v_max_mps: 25.0
+    decay_tau_s: 4.0
+    # elev lag işareti deadband (deg).
+    lag_sign_deadband_deg: 0.5
+    elev_drift_filt_alpha: 0.3
+    # Frame başına max |d_elev| (deg); spike kırpma.
+    elev_drift_step_max_deg: 0.6
+
+  # Terminal pass band — dive latch kaldırıldı (est4: 25m/s yan'da hiç latch yoktu).
+  # size >= ratio: asimetrik irtifa (sınırlı climb, sink/overfly serbest) + pitch bleed.
+  terminal:
+    size_ratio: 2.0
+    # Gate üstteyken (elev>0) tırmanma tavanı — balloon yok, 3–4m alt toparlanır.
+    climb_cap_mps: 1.5
+    # Terminalde hafif burun aşağı (geçiş; lat_slow ile çatışmaz: overfly/term önce).
+    pitch_des_deg: -10.0
+    pitch_bleed_deg_s: 10.0
+    # Terminal thr tavanı (enerji / post-pass balon).
+    thrust_cap: 0.38
+
+  lost_behavior:
+    # Bbox yokken yaw offset genliği (deg).
+    yaw_scan_offset_deg: 6.0
+    # EKF yokken / lost hedef pitch (derece). -3 est13'te lost tırmanışını besledi.
+    pitch_target_deg: -6.0
+    # Lost mod yaw offset çarpanı (mem ang_x üzerinde).
+    yaw_kp_scale: 0.25
+    # Lost mod roll (bank) çarpanı.
+    roll_cmd_scale: 0.5
+    # Lost iken tırmanıyorsa sink komutunu tut (vz_des decay'i ezme).
+    # est1: post-pass 24→33m — daha erken/sert arrest + thr tavanı.
+    climb_arrest_mps: 0.25
+    climb_sink_mps: 6.0
+    climb_pitch_des_deg: -10.0
+    climb_thrust_cap: 0.05
+
+  dynamics:
+    # Bbox büyüme hızı filt alpha.
+    bbox_rate_alpha: 0.25
+    # Bbox kaybında bbox_rate decay çarpanı.
+    bbox_rate_lost_decay: 0.8
+    # Varsayılan kontrol adımı (s); wall clock yoksa 1/default_hz.
+    default_dt_s: 0.03333333333333333
+
+  smoothing:
+    # EMA alpha per kanal: roll, pitch, thrust, yaw.
+    alpha_roll: 0.45
+    alpha_pitch: 0.58
+    alpha_throttle: 0.40
+    alpha_yaw: 0.50
+    # Attitude setpoint slew (deg/s veya thrust/s).
+    roll_slew_deg_s: 90.0
+    # Terminal yan yetişmede bank setpoint daha hızlı (est1 satürasyon gecikmesi).
+    roll_slew_term_deg_s: 140.0
+    pitch_slew_deg_s: 40.0
+    yaw_slew_deg_s: 45.0
+    throttle_rate_limit_per_s: 0.12
+    # Nose-down / overfly sink sırasında thrust'ın hızla düşmesi.
+    throttle_rate_limit_dive_per_s: 0.60

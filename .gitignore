@@ -1,0 +1,76 @@
+# =============================================================================
+# AVCI .gitignore
+# Kural: kod + config + dokuman + model agirligi (.pt) REPODA.
+#        Uretilen (build, engine, onnx) ve veri (log, kayit, video) REPODA DEGIL.
+# Tek dosyayi istisna olarak eklemek icin (ornek test fixture):
+#   !hunter-orin/tests/ornek_log.csv
+# Not: setup/repo_hazirla.sh icindeki girmez() ayni listeyi kullanir.
+# =============================================================================
+
+# --- Uretilen: her Orin'de yeniden uretilir ---
+build/
+__pycache__/
+*.pyc
+*.engine
+*.plan
+*.trt
+*.onnx
+*.cache
+*.bak
+runs/
+
+# --- Veri: ucus loglari, kayitlar, videolar (arsivi repo disinda) ---
+logs/
+*.log
+*.csv
+*.tlog
+*.tlog.raw
+*.BIN
+*.bin
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.h264
+*.h265
+*.264
+*.265
+*.hevc
+*.ts
+
+# --- Indirilen paket / arsiv (yeniden indirilir; torch wheel, cusparselt .deb ...) ---
+*.whl
+*.deb
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# --- Python sanal ortam ---
+venv/
+.venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# --- Gizli / kisisel ---
+.env
+*.pem
+id_rsa*
+id_ed25519*
+.git-credentials
+
+# --- Editor / OS ---
+.~lock.*
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- ISTISNALAR (yukaridaki kurallardan SONRA gelmeli) ---
+# hunter-orin C++ engine'leri bu ONNX'lerden uretilir (scripts/build_ortrack_engine.sh,
+# scripts/build_yolo_engine.sh). ORTrack .pth.tar (102 MB) GitHub'a giremez -> tek kaynak ONNX.
+# (orin-tiled-tracker'da ONNX yok: engine .pt'den uretilir)
+!hunter-orin/models/*.onnx

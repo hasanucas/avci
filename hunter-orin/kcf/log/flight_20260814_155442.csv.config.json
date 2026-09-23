@@ -1,0 +1,42 @@
+{
+  "ts": "2026-08-14 15:54:42",
+  "cam_host": "127.0.0.1",
+  "cam_port": 9999,
+  "fc": "udpout:127.0.0.1:14551",
+  "teacher": "mpc_teacher1",
+  "enable_override": true,
+  "no_fc": false,
+  "log": null,
+  "rev_roll": false,
+  "rev_pitch": false,
+  "rev_throttle": false,
+  "rev_yaw": false,
+  "gain_roll": 0.2,
+  "gain_pitch": 0.2,
+  "gain_throttle": 0.2,
+  "gain_yaw": 0.2,
+  "band_roll": 120,
+  "band_pitch": 120,
+  "band_throttle": 120,
+  "band_yaw": 120,
+  "auto_acro": true,
+  "exit_mode": "althold",
+  "AXIS_DIR": {
+    "roll": 1,
+    "pitch": -1,
+    "throttle": 1,
+    "yaw": 1
+  },
+  "AXIS_GAIN": {
+    "roll": 0.2,
+    "pitch": 0.2,
+    "throttle": 0.2,
+    "yaw": 0.2
+  },
+  "AXIS_BAND": {
+    "roll": 120,
+    "pitch": 120,
+    "throttle": 120,
+    "yaw": 120
+  }
+}

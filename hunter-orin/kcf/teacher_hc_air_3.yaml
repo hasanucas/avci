@@ -1,0 +1,246 @@
+# =============================================================================
+# teacher_hc_air_3.yaml — HUNTER (31 Agu 2026)
+# =============================================================================
+# KAYNAK: rate_tar.gz config/teacher_hc_air.yaml
+# hc_air_3.py ile birlikte kullanilir:
+#     --teacher hc_air_3 --teacher-config kcf/teacher_hc_air_3.yaml
+#
+# ESKI teacher_hc_air.yaml'a gore 3 TUNING degeri degisti (upstream karari):
+#     pitch_attitude.cruise_des_deg        -7.5 -> -9.5
+#     pitch_governor.des_accel_max_deg_s    9.0 -> 12.0
+#     pitch_governor.warmup_s               2.0 -> 1.0
+# 27 Agu vurusu ESKI degerlerle yapildi. Merdivende bunu hesaba kat.
+#
+# HUNTER'A OZEL: asagidaki `acro:` blogu SIM degerleriyle geliyordu
+# (RC 1000/1500/2000, DZ 20, expo 0.3, thr_mid 0.5, hover 0.33).
+# Senin FC'nde (mav.parm) hicbiri oyle degil — GERCEK degerlerle
+# dolduruldu. Ayrinti blogun kendi yorumunda.
+# =============================================================================
+
+# HCAir hard-coded teacher parametreleri.
+# Her değer bağımsızdır (birbirinden türetilmez). observation.yaml ile uyum
+# gereken alanlar yorumda belirtilir; değerleri elle senkron tutun.
+
+output:
+  # body_rate — SET_ATTITUDE_TARGET rad/s (default, guided_no_fps).
+  # acro_rc   — body rate hesaplanır, ArduPilot ACRO PWM'e çevrilir.
+  #
+  # HUNTER: bu değeri body_rate BIRAK. ACRO yolu controller_guided
+  # --action-units acro_pwm ile açılır ve dönüşümü acro_sender.py yapar
+  # (governor bayrakları --scale-*/--max-rate orada çalışsın diye).
+  # acro_rc değeri sadece offline A/B için var.
+  mode: body_rate
+
+acro:
+  # ---------------------------------------------------------------------------
+  # HUNTER GERCEK DEGERLERI — mav.parm'dan (upstream SIM degerleri degildi)
+  #
+  #   ACRO_RP_RATE   360      ACRO_RP_EXPO  0.0   (upstream 0.3 yaziyordu)
+  #   ACRO_Y_RATE    202.5    ACRO_Y_EXPO   0.0
+  #   ACRO_THR_MID   0.0      MOT_THST_HOVER 0.125
+  #   RC1..RC4  MIN 1045 / TRIM 1495 / MAX 1945 / DZ 0 / REVERSED 0
+  #   RCMAP     ROLL 1  PITCH 2  THROTTLE 3  YAW 4
+  #
+  # Bu blok SADECE FALLBACK'tir. acro_sender acilista
+  # try_load_acro_from_vehicle() ile bunlari FC'den okur ve uzerine yazar.
+  # FC'den okuma BASARISIZ olursa buraya duser — o yuzden dogru olmasi sart.
+  # Acilista basilan "[ACRO] Rate->PWM adapter config source:" satirini OKU:
+  #   "vehicle (MAVLink params)" = FC'den okundu (istenen)
+  #   "yaml (fallback)"          = bu blok kullaniliyor
+  # ---------------------------------------------------------------------------
+  rp_rate_deg_s: 360.0
+  rp_expo: 0.0
+  yaw_rate_deg_s: 202.5
+  yaw_expo: 0.0
+  # thr_mid_curve = clamp(ACRO_THR_MID>0 ? ACRO_THR_MID : MOT_THST_HOVER,
+  #                       0.125, 0.6875)
+  # ACRO_THR_MID=0 ve MOT_THST_HOVER=0.125 -> 0.125 (tabana dayali).
+  # MOT_THST_HOVER'i 0.102 yapsan bile clamp tabani 0.125 — bu deger DEGISMEZ.
+  thr_mid_curve: 0.125
+  # Teacher hover_thrust (0.07, action birimi) -> firmware normalized thrust.
+  # HUNTER gercek hover 0.101-0.102 (27 Agu vurus ucusunda seyir 0.086-0.096).
+  # DIKKAT: ACRO'da angle boost KAPALI. acro_sender bunu ayrica ekliyor.
+  hover_thrust_firmware: 0.101
+  thrust_scale: 0.50
+  rate_limits:
+    # Bu kelepceler acro_sender'in --scale-*/--max-rate governor'undan SONRA
+    # gelen SON siniridir. p/q 1.20 rad/s = 68.8 deg/s, r 1.00 = 57.3 deg/s.
+    # ILK ACRO UCUSUNDA --acro-max-rate 20 gibi bir tavanla gir.
+    p_max_rad_s: 1.20
+    q_max_rad_s: 1.20
+    r_max_rad_s: 1.00
+    # Dairesel stick limiti (ArduPilot roll+pitch ortak). Asilirsa adapter
+    # komutu REDDEDER -> acro_sender son gecerli PWM'i tutar ve sayac artar.
+    max_rp_stick_radius: 0.85
+  channels:
+    roll: 1
+    pitch: 2
+    throttle: 3
+    yaw: 4
+  rc:
+    roll:     {min_pwm: 1045, trim_pwm: 1495, max_pwm: 1945, deadzone: 0, reversed: false}
+    pitch:    {min_pwm: 1045, trim_pwm: 1495, max_pwm: 1945, deadzone: 0, reversed: false}
+    throttle: {min_pwm: 1045, trim_pwm: 1495, max_pwm: 1945, deadzone: 0, reversed: false}
+    yaw:      {min_pwm: 1045, trim_pwm: 1495, max_pwm: 1945, deadzone: 0, reversed: false}
+
+platform:
+  # Sim / gerçek drone hover collective (0..1). Thrust FF ve tilt comp tabanı.
+  hover_thrust: 0.07
+  # SET_ATTITUDE_TARGET thrust komut alt/üst sınırı (env clip ile aynı olmalı).
+  thrust_cmd_min: -0.2
+  thrust_cmd_max: 0.5
+  # Privileged (EKF vz) yokken açık çevrim FF thrust çarpanı.
+  ff_open_loop_scale: 1.08
+  # Bank/pitch tilt compensation: cos(tilt) bu değerin altına inmez.
+  tilt_cos_min: 0.5
+
+action_limits:
+  # Body rate komut tavanları (rad/s). Env step() clipping ile uyumlu.
+  roll_rad_s: 1.884955592153876
+  pitch_down_rad_s: 0.3769911184307752
+  pitch_up_rad_s: 0.3769911184307752
+  yaw_rad_s: 1.0602875205865552
+
+camera:
+  # obs[12] yoksa kullanılan varsayılan gimbal pitch (derece).
+  # observation.yaml image.pitch_deg ile aynı tutun (-15 = 15° yukarı mount).
+  pitch_default_deg: -15.0
+  # Dikey LOS offset (derece). Gate elevation = offset + transfer*pitch - ang_y.
+  # Bağımsız değer; tipik sim için 15 (= -pitch_default).
+  axis_offset_deg: 15.0
+  # Body pitch'in gate elevation'a katkısı (0=ihmal, 1=tam).
+  pitch_transfer: 0.85
+
+yaw:
+  # ang_x deadband (derece); altında yaw komutu sıfır.
+  ang_x_deadband_deg: 0.10
+  # Yatay nişan P: ang_x (deg) → yaw rate (rad/s).
+  kp_rad_s_per_deg: 0.1113301896615883
+  # Yaw rate D: body yaw rate (deg/s) → damping (rad/s).
+  kd_body_rad_s_per_dps: 0.010602875205865551
+  # Yaw rate komut satürasyonu (rad/s).
+  max_cmd_rad_s: 0.9542587685278996
+
+pitch_attitude:
+  # Closure governor hedef pitch (derece, negatif = burun aşağı).
+  cruise_des_deg: -9.5
+  des_min_deg: -24.0
+  des_max_deg: 8.0
+  # vz fazla yüksekken pitch tavanını gevşet (climb assist).
+  assist_climb_err_mps: 1.5
+  assist_sink_err_mps: 2.5
+  assist_k_deg_per_mps: 3.0
+  assist_max_deg: 8.0
+  # Sink assist aktifken pitch taban sınırı (daha az agresif dive).
+  des_min_relaxed_deg: -14.0
+  # EKF yokken sabit pitch hedefi (derece).
+  fallback_des_deg: -6.0
+  # Pitch attitude inner loop: pitch error (deg) → pitch rate (rad/s).
+  kp_rad_s_per_deg: 0.021205750411731103
+  kd_body_rad_s_per_dps: 0.01884955592153876
+  max_cmd_rad_s: 0.40055306333269863
+
+pitch_governor:
+  # Filtrelenmiş bbox closure hedefi (1/s, pozitif = yaklaşma).
+  closure_target_per_s: 0.05
+  closure_filt_alpha: 0.08
+  # Closure hatasına göre pitch_des ramp (deg/s per closure unit).
+  ramp_up_deg_s_per_unit: 12.0
+  ramp_down_deg_s_per_unit: 4.0
+  # pitch_des değişim hız tavanı (deg/s).
+  des_accel_max_deg_s: 12.0
+  # Track lock sonrası governor devreye girmeden bekleme (s).
+  warmup_s: 1.0
+  # Governor gate: max |ang_x| (deg) normal / receding mod.
+  aim_max_deg: 3.0
+  chase_aim_max_deg: 10.0
+  # Governor gate: |pitch_des - pitch| max (deg).
+  pitch_err_max_deg: 12.0
+  # Governor gate: |vz_des - vz_up| max (m/s) normal / receding.
+  vz_err_max_mps: 3.0
+  chase_vz_err_max_mps: 5.5
+  # closure_filt bu eşiğin altında "receding" (kapı uzaklaşıyor).
+  recede_threshold_per_s: 0.0
+  # Küçük bbox'ta yavaşlama governor'ı devreye girmez (norm. bbox size).
+  no_slowdown_size: 0.03
+  # Bbox kaybı sonrası lock timer sıfırlama eşiği (s).
+  lock_reset_after_s: 0.5
+  # Dikey hata büyükken pitch_des'i cruise'a doğru gevşet (deg/s).
+  vert_brake_deg_s: 1.5
+  # Bbox kaybında pitch_des decay başlangıç gecikmesi (s).
+  lost_des_decay_after_s: 2.0
+  lost_des_decay_deg_s: 3.0
+
+roll:
+  # Wings-level P: roll (deg) → roll rate (rad/s).
+  kp_level_rad_s_per_deg: 0.05654866776461628
+  # Crab: filtrelenmiş LOS azimuth rate (deg/s) → roll rate (rad/s).
+  kp_crab_los_rad_s_per_dps: 0.08482300164692441
+  los_az_filt_alpha: 0.36
+  # Bbox kaybında LOS az filt decay çarpanı (her adım).
+  los_az_lost_decay: 0.8
+  max_cmd_rad_s: 1.0367255756846316
+
+vertical_thrust:
+  # Dikey hız PI: vz error (m/s) → thrust delta.
+  kp: 0.120
+  ki: 0.040
+  # LOS pursuit: vz_des = k_pursuit * v_eff * tan(elev).
+  k_pursuit: 1.8
+  # Referans pursuit hızı (m/s); GPS yok, sabit taban hız.
+  v_pursuit_ref_mps: 15.0
+  vz_int_max: 0.22
+  vz_des_max_mps: 12.0
+  t_fb_max: 0.45
+  # Bbox kaybında vz_des hold decay tau (s).
+  lost_vz_decay_tau_s: 1.0
+
+vertical_adapt:
+  # Elevation lag pozitifken v_adapt artış kazancı (m/s per deg drift).
+  k_per_deg: 15.0
+  v_max_mps: 35.0
+  decay_tau_s: 4.0
+  # elev lag işareti deadband (deg).
+  lag_sign_deadband_deg: 0.5
+  elev_drift_filt_alpha: 0.3
+  # Frame başına max |d_elev| (deg); spike kırpma.
+  elev_drift_step_max_deg: 0.6
+
+dive_phase:
+  # bbox_size / init_size >= ratio ve nişan OK → dive latch.
+  size_ratio: 4.5
+  aim_max_deg: 1.0
+
+lost_behavior:
+  # Bbox yokken yaw scan genliği (rad/s).
+  yaw_scan_rad_s: 0.10602875205865551
+  # EKF yokken hedef pitch (derece).
+  pitch_target_deg: -3.0
+  # EKF yokken pitch P kazancı (deg error → rad/s).
+  pitch_kp_rad_s_per_deg: 0.011780972450961725
+  # Lost mod yaw komut çarpanı (mem ang_x üzerinde).
+  yaw_kp_scale: 0.25
+  # Lost mod roll komut çarpanı.
+  roll_cmd_scale: 0.5
+  # Lost mod pitch komut çarpanı (max_pitch ile çarpılır).
+  pitch_cmd_scale: 0.4
+
+dynamics:
+  # Bbox büyüme hızı filt alpha.
+  bbox_rate_alpha: 0.25
+  # Bbox kaybında bbox_rate decay çarpanı.
+  bbox_rate_lost_decay: 0.8
+  # Varsayılan kontrol adımı (s); wall clock yoksa 1/default_hz.
+  default_dt_s: 0.03333333333333333
+
+smoothing:
+  # EMA alpha per kanal: roll, pitch, thrust, yaw.
+  alpha_roll: 0.45
+  alpha_pitch: 0.58
+  alpha_throttle: 0.40
+  alpha_yaw: 0.50
+  # Komut slew rate limitleri (rad/s veya thrust/s).
+  roll_rate_limit_rad_s: 0.7539822368615504
+  pitch_rate_limit_rad_s: 0.5654866776461628
+  yaw_rate_limit_rad_s: 0.5831581363226054
+  throttle_rate_limit_per_s: 0.12

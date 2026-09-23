@@ -1,0 +1,6 @@
+## Ethernet NetworkManager profilleri: ad | ipv4.method | adresler | autoneg | arayuz
+camera-eth | manual | 192.168.144.10/24 | no | enx00e04c6802b3
+Wired connection 1 | manual | 192.168.144.50/24 | yes | enP8p1s0
+## eno1
+eno1 yok
+EEE-off dispatcher: VAR

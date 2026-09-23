@@ -1,0 +1,11 @@
+# HUNTER Orin — Python bagimliliklari (gercek import taramasiyla uretildi)
+# controller_orin.py + mpc_teacher1.py SADECE bunlari kullaniyor; gerisi
+# (torch, ROS, ultralytics, tensorrt...) sistemde olabilir ama uctaki kod
+# import ETMIYOR. PN teacher saf matematik -> model/torch GEREKMEZ.
+#
+# Standart kutuphane (kurulum gerekmez): argparse, importlib, math,
+#                                        socket, sys, threading, time
+#
+# Test edilmis surumler (Orin, L4T R36.4.7, Python 3.10):
+numpy==1.25.2
+pymavlink==2.4.49

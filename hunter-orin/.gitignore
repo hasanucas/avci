@@ -1,0 +1,25 @@
+# Build
+kcf/build/
+build/
+*.o
+*.so
+*.a
+
+# Flight loglari (her ucusta uretilir)
+*.csv
+flight_*.csv
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# NOT: mavlink/ klasoru DAHIL edilir (reprodüklenebilirlik icin).
+# 29MB ama yeni Orin'de derleme icin sart — .gitignore'a EKLEME.

@@ -1,0 +1,216 @@
+# fpv_gate_2_dalis.yaml — HUNTER DALIS VARYANTI (25 Agu)
+# Orijinal fpv_gate_2.yaml'dan SADECE 2 deger farkli:
+#   vertical_thrust.far_sink_cap_mps : 2.0 -> 8.0
+#     (uzakta sink kilidi; 2.0 = suzulme egimi ~9 derece, dik dalisa izin yok)
+#   pitch_attitude.des_min_relaxed_deg : -10.0 -> -20.0
+#     (sink assist aktifken pitch tabani; -10 burnu kaldirip kadraj kaybettiriyordu)
+# Sim dogrulamasi (yamali teacher, 1 m balon @ 50 m):
+#   75m/110m ve 90m/160m girisler -> minR 3.2-3.3 m, maxsink -8 m/s = TEMAS
+#   Orijinal cfg ayni geometrilerde 2-3 s'de kadraj kaybediyordu.
+# GIRIS ZARFI: bakis hatti ufkun 8-16 derece altinda olacak sekilde gir
+#   (balon 50 m ise: drone 75-95 m irtifa, 110-170 m yatay mesafe).
+#   -17 dereceden dik bakis = pitch tabani -24 + kamera +15 fizigi, tutmaz.
+# Kullanim: --teacher-config fpv_gate_2_dalis.yaml
+image:
+  width: 1280
+  height: 720
+  hfov_deg: 80.0
+  pitch_deg: -15.0
+observation:
+  vision:
+  - bbox_cx
+  - bbox_cy
+  - bbox_w
+  - bbox_h
+  - angular_x_deg
+  - angular_y_deg
+  attitude:
+  - roll_deg
+  - pitch_deg
+  - yaw_deg
+  - roll_rate_dps
+  - pitch_rate_dps
+  - yaw_rate_dps
+  meta:
+  - camera_pitch_deg
+  - bbox_valid
+action:
+- roll_cmd
+- pitch_cmd
+- throttle_cmd
+- yaw_cmd
+dimensions:
+  obs: 14
+  action: 4
+bridge:
+  tcp_port: 9999
+  mavlink_port: 14552
+  packet_magic: 1146244942
+  camera_topic: /world/iris_runway/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image
+hc_air:
+  platform:
+    hover_thrust: 0.07
+    thrust_cmd_min: -0.3
+    thrust_cmd_max: 0.75
+    ff_open_loop_scale: 1.08
+    tilt_cos_min: 0.5
+  action_limits:
+    max_bank_deg: 40.0
+    pitch_des_min_deg: -24.0
+    pitch_des_max_deg: 8.0
+    max_yaw_offset_deg: 45.0
+  camera:
+    pitch_default_deg: -15.0
+    axis_offset_deg: 15.0
+    pitch_transfer: 0.85
+    use_gate_top_reticle: true
+    reticle_elev_bias_deg: -6.0
+  yaw:
+    ang_x_deadband_deg: 0.1
+    kp_offset_deg_per_deg: 2.5
+    max_offset_deg: 45.0
+  pitch_attitude:
+    cruise_des_deg: -7.5
+    des_min_deg: -24.0
+    des_max_deg: 8.0
+    assist_climb_err_mps: 1.5
+    assist_sink_err_mps: 1.0
+    assist_k_deg_per_mps: 3.0
+    assist_max_deg: 8.0
+    des_min_relaxed_deg: -20.0
+    fallback_des_deg: -6.0
+  altitude_protect:
+    sink_mps: 0.8
+    thrust_sat_frac: 0.9
+    thrust_sat_vz_margin_mps: 0.25
+    bleed_deg_s: 14.0
+    sat_pitch_floor_cruise: true
+  ground_floor:
+    enabled: true
+    floor_m: 4.0
+    soft_start_m: 12.0
+    max_sink_near_mps: 0.0
+    climb_arrest_mps: 3.0
+    pitch_bleed_deg_s: 25.0
+    pitch_hold_des_deg: 0.0
+    override_overfly: true
+    bypass_terminal_thrust_cap: true
+    pass_size_ratio: 1.5
+    pass_aim_deg: 4.0
+    crash_floor_m: 1.2
+    crash_soft_start_m: 2.5
+  pitch_governor:
+    closure_target_per_s: 0.05
+    closure_filt_alpha: 0.08
+    ramp_up_deg_s_per_unit: 12.0
+    ramp_down_deg_s_per_unit: 4.0
+    des_accel_max_deg_s: 9.0
+    warmup_s: 2.0
+    aim_max_deg: 3.0
+    chase_aim_max_deg: 10.0
+    pitch_err_max_deg: 12.0
+    vz_err_max_mps: 3.0
+    chase_vz_err_max_mps: 5.5
+    recede_threshold_per_s: 0.0
+    no_slowdown_size: 0.03
+    lock_reset_after_s: 0.5
+    vert_brake_deg_s: 1.5
+    lat_slow_size_ratio: 1.0
+    lat_slow_aim_deg: 0.8
+    lat_slow_des_deg: -6.0
+    lat_slow_deg_s: 14.0
+    lat_slow_climb_elev_deg: 2.0
+    lat_slow_climb_cap_mps: 1.5
+    lost_des_decay_after_s: 2.0
+    lost_des_decay_deg_s: 3.0
+  roll:
+    kp_crab_bank_deg_per_dps: 2.0
+    los_az_filt_alpha: 0.18
+    los_az_lost_decay: 0.8
+    crab_los_deadband_dps: 1.5
+    los_crab_soft_sat_dps: 10.0
+    crab_far_ref_size_ratio: 1.0
+    crab_far_size_floor: 0.35
+    crab_far_scale_max: 1.8
+    crab_near_size_ratio: 1.0
+    crab_near_scale: 1.8
+    crab_near_deadband_dps: 0.6
+    crab_term_scale: 1.5
+    crab_term_require_off_aim: true
+    crab_term_aim_deg: 2.0
+    kp_ang_x_bank_deg_per_deg: 4.0
+    ang_x_bank_size_ratio: 0.35
+    ang_x_term_scale: 2.0
+    max_bank_deg: 40.0
+    max_bank_term_deg: 40.0
+    overfly_bank_shed_frac: 0.55
+    overfly_bank_shed_climb_mps: 0.5
+    overfly_bank_shed_ax_min_deg: 3.0
+    climb_bank_shed_frac: 0.5
+    climb_bank_shed_vz_des_mps: 1.5
+    climb_bank_shed_ax_min_deg: 2.5
+    yaw_term_scale: 1.35
+  vertical_thrust:
+    kp: 0.12
+    ki: 0.04
+    k_pursuit: 1.8
+    v_pursuit_ref_mps: 15.0
+    vz_int_max: 0.22
+    vz_des_max_mps: 12.0
+    far_sink_cap_mps: 8.0
+    t_fb_max: 0.45
+    pitch_thrust_gain: 0.028
+    sink_ff_fade_elev_deg: -4.0
+    lost_vz_decay_tau_s: 1.0
+  overfly:
+    size_ratio: 2.0
+    elev_deg: -2.0
+    sink_boost: 1.5
+    min_sink_mps: 2.5
+    pitch_bleed_deg_s: 14.0
+    pitch_des_deg: -14.0
+    thrust_cmd_min: -0.3
+    zero_tilt_ff: true
+    reset_vz_int_on_enter: true
+  vertical_adapt:
+    k_per_deg: 10.0
+    v_max_mps: 25.0
+    decay_tau_s: 4.0
+    lag_sign_deadband_deg: 0.5
+    elev_drift_filt_alpha: 0.3
+    elev_drift_step_max_deg: 0.6
+  terminal:
+    ref_width_m: 0.5
+    ref_height_m: 0.5
+    ref_range_m: 20.0
+    climb_cap_mps: 1.5
+    climb_cap_above_elev_deg: 1.0
+    climb_cap_above_mps: 6.0
+    bypass_thrust_cap_above_elev_deg: 1.0
+    pitch_des_deg: -10.0
+    pitch_bleed_deg_s: 10.0
+    thrust_cap: 0.38
+  lost_behavior:
+    yaw_scan_offset_deg: 6.0
+    pitch_target_deg: -6.0
+    yaw_kp_scale: 0.25
+    roll_cmd_scale: 0.5
+    climb_arrest_mps: 0.25
+    climb_sink_mps: 6.0
+    climb_pitch_des_deg: -10.0
+    climb_thrust_cap: 0.05
+  dynamics:
+    bbox_rate_alpha: 0.25
+    bbox_rate_lost_decay: 0.8
+    default_dt_s: 0.03333333333333333
+  smoothing:
+    alpha_roll: 0.32
+    alpha_pitch: 0.58
+    alpha_throttle: 0.4
+    alpha_yaw: 0.5
+    roll_slew_deg_s: 45.0
+    roll_slew_term_deg_s: 55.0
+    pitch_slew_deg_s: 40.0
+    yaw_slew_deg_s: 45.0
+    throttle_rate_limit_per_s: 0.12
+    throttle_rate_limit_dive_per_s: 0.6

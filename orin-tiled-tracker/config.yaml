@@ -1,0 +1,67 @@
+# =====================================================================
+#  Orin Nano Tiled Detection + Tracking Pipeline — Konfigürasyon
+#  Model-bağımsız: drone / ekmek / araba... sadece modeli ve sınıfları değiştir.
+# =====================================================================
+
+source:
+  type: "file"              # "file" | "rtsp"
+  path: "/home/avci2/Videos/test.mp4"          # dosya yolu ya da rtsp://kullanici:sifre@ip:554/stream
+  codec: "h264"             # rtsp için: "h264" | "h265"
+  rtsp_latency_ms: 100      # rtspsrc latency (düşük = az gecikme, ağ kötüyse artır)
+  reconnect_delay_s: 3.0    # RTSP koptuğunda yeniden bağlanma bekleme süresi
+  use_hw_decode: true       # Jetson nvv4l2decoder (PC'de test için false yap)
+  process_every_frame: true # SADECE dosya modunda: her kare işlensin (offline analiz)
+                            # RTSP'de daima "en güncel kare" stratejisi kullanılır
+
+model:
+  engine_path: "UAV-YOLOv11m.engine"  # Orin ÜZERİNDE build edilmiş TensorRT engine
+  pt_path: "UAV-YOLOv11m.pt"          # engine yoksa fallback (yavaş) + export kaynağı
+  imgsz: 768                # tile inference boyutu (engine ile aynı olmalı)
+  conf_thres: 0.25
+  iou_thres: 0.45
+  target_classes: []        # boş = tüm sınıflar; ör. [0] veya [0, 2]
+  fp16: true                # .pt fallback için; engine'de precision zaten gömülü
+  warmup_batch: 4           # açılışta ısınma batch boyutu (ilk kare yavaşlığını önler)
+
+tiler:
+  grid_cols: 2
+  grid_rows: 2              # 2x2 = 4 tile (varsayılan) | 3x2 için cols:3 rows:2 = 6 tile
+  overlap_ratio: 0.20       # tile başına %20 bindirme (sınırdaki nesneler için)
+  global_pass: false        # true: tam kareyi de düşük çözünürlükte EKSTRA geçir
+                            # (büyük nesneleri kaçırmamak için; batch'e +1 tile ekler)
+
+fusion:
+  method: "wbf"             # "wbf" (önerilen: tile sınırında daha iyi kutu) | "nms"
+  iou_thres: 0.5
+  class_agnostic: false     # false = sınıf-bilinçli birleştirme
+
+tracker:
+  track_high_thresh: 0.5    # ByteTrack aşama-1 (yüksek güven) eşiği
+  track_low_thresh: 0.3     # aşama-2 (düşük güvenle kurtarma) alt eşiği
+  new_track_thresh: 0.6     # yeni track açma eşiği
+  match_iou_thresh: 0.2     # eşleşme için min IoU
+  max_age: 30               # kayıp track'in Kalman predict ile sürdürüldüğü kare sayısı
+  confirm_window: 30        # M  -> "son 30 karede"
+  confirm_min_hits: 15      # N  -> "en az 20 tespit" => onaylı/görünür track (20/30)
+  smoothing:
+    enabled: true           # One-Euro kutu yumuşatma (jitter/titreme önleme)
+    min_cutoff: 1.0         # DÜŞÜR -> daha yumuşak kutu (ama biraz daha lag)
+    beta: 0.05              # ARTIR -> hızlı harekette daha az lag
+
+stabilizer:
+  enabled: false            # görüntü stabilizasyonu (CPU ~8-15 ms/kare maliyet)
+  max_corners: 200
+  smoothing_ema: 0.85       # 0-1; artır -> daha yumuşak kamera hareketi
+  crop_ratio: 0.04          # kenar siyah bantları örtmek için %4 zoom
+
+outputs:
+  display: true             # cv2.imshow canlı izleme ('q' ile çık)
+  file:
+    enabled: false
+    path: "out.mp4"
+    fps: 30
+  frame_callback: true      # kullanıcının RTSP restream koduna frame verme (ASIL amaç)
+
+profiling:
+  enabled: true
+  report_every: 60          # her 60 karede aşama süreleri + FPS logu

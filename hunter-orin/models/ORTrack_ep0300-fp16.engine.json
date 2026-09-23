@@ -1,0 +1,146 @@
+{
+  "kind": "ortrack-tensorrt",
+  "created_utc": "2026-09-09T09:32:03.515197+00:00",
+  "config": "/home/beyond/Desktop/detect-track/YoloORTrack/configs/orin-video-optimized.yaml",
+  "experiment": "deit_tiny_patch16_224",
+  "template_size": 128,
+  "search_size": 256,
+  "checkpoint": {
+    "path": "/home/beyond/Desktop/detect-track/YoloORTrack/models/ORTrack_ep0300.pth.tar",
+    "sha256": "4970400b82d78c852f4268b6b8088e2b126557aada54c67b0d71f95f5ce789bd"
+  },
+  "torch_version": "2.8.0",
+  "scope": "Device and TensorRT specific plan. Rebuild on the target; never commit or copy.",
+  "onnx": {
+    "opset": 17,
+    "ir_version": 8,
+    "checkpoint_info": {
+      "epoch": 300,
+      "net_type": "OSTrack",
+      "state_tensors": 242,
+      "blocks": 12,
+      "parameters": 8078661
+    },
+    "attention": "explicit",
+    "explicit_attention_blocks": 12,
+    "operators": [
+      "Add",
+      "Clip",
+      "Concat",
+      "Constant",
+      "Conv",
+      "Div",
+      "Erf",
+      "LayerNormalization",
+      "MatMul",
+      "Mul",
+      "Relu",
+      "Reshape",
+      "Shape",
+      "Sigmoid",
+      "Slice",
+      "Softmax",
+      "Split",
+      "Squeeze",
+      "Transpose",
+      "Unsqueeze"
+    ],
+    "io_shapes": {
+      "template": [
+        1,
+        3,
+        128,
+        128
+      ],
+      "search": [
+        1,
+        3,
+        256,
+        256
+      ],
+      "score_map": [
+        1,
+        1,
+        16,
+        16
+      ],
+      "size_map": [
+        1,
+        2,
+        16,
+        16
+      ],
+      "offset_map": [
+        1,
+        2,
+        16,
+        16
+      ]
+    },
+    "path": "/home/beyond/Desktop/detect-track/YoloORTrack/models/ORTrack_ep0300.onnx",
+    "sha256": "14444fb433558f6cbc8dd22074e1d30d08163d9dace2602bf54acfef29bc23bd"
+  },
+  "device_name": "Orin",
+  "engine": {
+    "tensorrt_version": "10.3.0",
+    "workspace_mib": 1024,
+    "build_seconds": 89.191463865,
+    "layers": 969,
+    "precision": "fp16",
+    "path": "/home/beyond/Desktop/detect-track/YoloORTrack/models/ORTrack_ep0300-fp16.engine",
+    "sha256": "631b750245c2539ff1fcd9e91f3297e9931de58ca1159eb87d5caa24507dbf33",
+    "io": {
+      "template": {
+        "mode": "INPUT",
+        "dtype": "FLOAT",
+        "shape": [
+          1,
+          3,
+          128,
+          128
+        ]
+      },
+      "search": {
+        "mode": "INPUT",
+        "dtype": "FLOAT",
+        "shape": [
+          1,
+          3,
+          256,
+          256
+        ]
+      },
+      "score_map": {
+        "mode": "OUTPUT",
+        "dtype": "FLOAT",
+        "shape": [
+          1,
+          1,
+          16,
+          16
+        ]
+      },
+      "size_map": {
+        "mode": "OUTPUT",
+        "dtype": "FLOAT",
+        "shape": [
+          1,
+          2,
+          16,
+          16
+        ]
+      },
+      "offset_map": {
+        "mode": "OUTPUT",
+        "dtype": "FLOAT",
+        "shape": [
+          1,
+          2,
+          16,
+          16
+        ]
+      }
+    }
+  },
+  "precision": "fp16"
+}

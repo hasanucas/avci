@@ -1,0 +1,8 @@
+# Jetson notu: OpenCV'yi pip'ten KURMAYIN (opencv-python'da GStreamer yok).
+# JetPack ile gelen sistem cv2'sini kullanın; kontrol:
+#   python3 -c "import cv2; print(cv2.getBuildInformation())" | grep -i gstreamer
+# PyTorch'u Jetson'a NVIDIA'nın JetPack-6 wheel'lerinden kurun (pip'ten değil).
+ultralytics>=8.3.0
+scipy>=1.10
+pyyaml>=6.0
+numpy<2.0        # Jetson torch wheel'leri numpy 2 ile uyumsuz olabiliyor

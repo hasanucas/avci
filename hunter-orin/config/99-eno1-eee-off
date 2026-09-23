@@ -1,0 +1,5 @@
+#!/bin/bash
+# eno1 her UP oldugunda EEE'yi kapat
+# Kok neden: Orin RTL8111 <-> SIYI VTX PHY 802.3az/EEE uyumsuzlugu -> link flap
+# Kanit: A/B/A testi (10 Haz 2026): EEE off=0 flap, on=30sn'de flap, off=0 flap
+[ "$1" = "eno1" ] && [ "$2" = "up" ] && /usr/sbin/ethtool --set-eee eno1 eee off

@@ -1,0 +1,48 @@
+# AVCI referans ortam — 2026-09-23 11:37:51 — ubuntu — avci2
+# Anahtar satirlar (kurulum_orin.sh / kontrol.sh okur):
+L4T=R36.4.7
+JETPACK=6.2.1+b38
+GUC_MODU=MAXN_SUPER
+
+## L4T
+# R36 (release), REVISION: 4.7, GCID: 42132812, BOARD: generic, EABI: aarch64, DATE: Thu Sep 18 22:54:44 UTC 2025
+## Guc modu
+NV Power Mode: MAXN_SUPER
+2
+## Sistem
+kernel  : 5.15.148-tegra aarch64
+python  : Python 3.10.12
+cmake   : cmake version 3.22.1
+gcc     : 11.4.0
+gst     : GStreamer 1.20.3
+opencv4 : 4.8.0 (C++ / pkg-config)
+cuda    : Build cuda_12.6.r12.6/compiler.34714021_0
+ram     : 7607 MB
+swap    :
+  NAME       TYPE      SIZE USED PRIO
+  /dev/zram0 partition 634M   0B    5
+  /dev/zram1 partition 634M   0B    5
+  /dev/zram2 partition 634M   0B    5
+  /dev/zram3 partition 634M   0B    5
+  /dev/zram4 partition 634M   0B    5
+  /dev/zram5 partition 634M   0B    5
+## GStreamer eklentileri
+nvv4l2decoder: VAR
+x264enc: VAR
+rtspclientsink: YOK
+h265parse: VAR
+## ffmpeg (PATH sirasiyla)
+/usr/local/bin/ffmpeg : ffmpeg version 7.0.2-static https://johnvansickle.com/ffmpeg/  Copyright (c) 2000-2024 the FFmpeg developers
+## Python paketleri (import edilen surum + yeri)
+numpy        1.26.4                               [/home/avci2/.local/lib/python3.10/site-packages/numpy/__init__.py]
+cv2          4.5.4                              GStreamer:                   YES (1.19.90)  [/usr/lib/python3/dist-packages/cv2.cpython-310-aarch64-linux-gnu.so]
+torch        2.5.0a0+872d972e41.nv24.08         cuda=True  [/home/avci2/.local/lib/python3.10/site-packages/torch/__init__.py]
+torchvision  0.20.0a0+afc54f7                     [/home/avci2/.local/lib/python3.10/site-packages/torchvision/__init__.py]
+tensorrt     10.3.0                               [/usr/lib/python3.10/dist-packages/tensorrt/__init__.py]
+onnx         1.23.0                               [/home/avci2/.local/lib/python3.10/site-packages/onnx/__init__.py]
+onnxruntime  1.20.0                             TensorrtExecutionProvider,CUDAExecutionProvider,CPUExecutionProvider  [/home/avci2/.local/lib/python3.10/site-packages/onnxruntime/__init__.py]
+ultralytics  8.4.157                              [/home/avci2/.local/lib/python3.10/site-packages/ultralytics/__init__.py]
+scipy        1.8.0                                [/usr/lib/python3/dist-packages/scipy/__init__.py]
+yaml         5.4.1                                [/usr/lib/python3/dist-packages/yaml/__init__.py]
+pymavlink    2.4.49                               [/home/avci2/.local/lib/python3.10/site-packages/pymavlink/__init__.py]
+MAVProxy     ?                                    [/home/avci2/.local/lib/python3.10/site-packages/MAVProxy/__init__.py]
