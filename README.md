@@ -1,5 +1,7 @@
 # AVCI — Orin + laptop yazılımı (tek repo)
 
+AVCI FOLLOW KODU LAPTOPTA ÇALIŞAN --- HUNTER_ORİN DRONE KONTROL ALGOTİRMTASI, GÖRÜNTÜ AKTARIMI İÇEREN TARAF -- ORIN TILED  TRACKER COK ONEMLI DEGIL TRACKER DENEMESI AMA EKLEDİM
+
 HUNTER'ın Orin tarafı, tiled tracker ve laptop tarafı (`avci_follow`) tek repoda. Yeni bir Orin'e **tek komutla** kurulur, çalışan Orin'de her şey eskisi gibi çalışır.
 
 | Klasör | Ne | Ayrıntı |
