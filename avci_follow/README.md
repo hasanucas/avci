@@ -30,11 +30,13 @@ FOLLOW'a düşer.
 ## Dosyalar
 ```
 follow_gps.py       ana script (transport + planlayıcı sürücü)
+serial_udp_bridge.py  iki bilgisayar: gelen telemetri baytını diğer USB'ye basar (hesap yok)
 chaser_env.py       pymavlink adaptörü (planlayıcı → gerçek drone)
 link_log.py         telemetri/gecikme loglama
 fpv_gate_il/        vendorlanan yörünge paketi (13/14 dosya birebir; mav_bridge tek satır nötr)
 test_offline.py     planlayıcı mantığı regresyonu (donanımsız)
 test_wiring.py      montajlı yığın entegrasyon testi (donanımsız)
+test_udp_bridge.py  seri↔UDP köprü testi (donanımsız)
 ```
 
 ## Kurulum
@@ -42,10 +44,46 @@ test_wiring.py      montajlı yığın entegrasyon testi (donanımsız)
 pip install pymavlink pyserial numpy
 ```
 
+## İki bilgisayar (UDP)
+
+Bu ayrım plan yapmaz. Bir telsizden okunan bayt diğer bilgisayarın telsizine
+aynen yazılır; ters yönde de aynı. İki bilgisayar aynı ağda olabilir veya
+doğrudan bir ethernet kablosuyla bağlanır.
+
+```
+telsiz --USB-->  PC1  --UDP-->  PC2  --USB-->  telsiz
+```
+
+Doğrudan kablo için örnek statik adres (ağ geçidi gerekmez, maske `255.255.255.0`):
+
+| Makine | Adres | Ne takılı |
+|---|---|---|
+| PC1 | `192.168.50.1` | telemetri gelen telsiz |
+| PC2 | `192.168.50.2` | telemetri giden telsiz |
+
+Aynı ağdaysalar PC1'in o ağdaki adresini kullan; statik şart değil.
+
+PC1'i **önce** başlat:
+
+```
+python serial_udp_bridge.py --serial COM12 --baud 57600 --udp-port 14560
+```
+
+PC2:
+
+```
+python serial_udp_bridge.py --serial COM5 --baud 57600 --peer 192.168.50.1:14560
+```
+
+Windows güvenlik duvarı her iki makinede Python'un özel ağda UDP almasına izin
+vermelidir. PC1 `14560` portunu dinler. Karşı uç belli olana kadar PC1 telsizden
+okuduğu baytı biriktirmez. Tek makinede GPS takip (`follow_gps.py`) bu köprüden
+ayrıdır ve durduğu gibi durur.
+
 ## ZORUNLU iş akışı (sırasıyla)
 1. **Önce offline testler** — her saha çıkışından önce:
    ```
-   python test_offline.py && python test_wiring.py
+   python test_offline.py && python test_wiring.py && python test_udp_bridge.py
    ```
 2. **Dry-run + dikey ayrım okuması** (FC'ye komut YOK):
    ```
