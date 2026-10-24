@@ -1,0 +1,39 @@
+# gite_gonder raporu — 2026-10-24 10:56 — ubuntu — avci2
+taban (GitHub main): fed2bfb 2026-09-24 Update README with AVCI follow code details
+etiket: orin-2026-10-24
+yedek klasoru: /home/avci2/Desktop/_repo_yedek/20261024_105616
+sistem dosyasi kopyalari (repoda degil): /home/avci2/Desktop/avci_sistem_20261024_105616.tar.gz
+
+Yeni klasorler:
+  hunter-orin/avci_follow/                                27 dosya     0.4 MB
+Klasor bazinda (+yeni ~degisen -silinen):
+  hunter-orin                    +49    ~11    -4
+  setup                          +1     ~0     -0
+Git'ten cikanlar (4):
+  - hunter-orin/kcf/runtracker03082026.cpp
+  - hunter-orin/models/UAV-YOLOv11m-768.onnx
+  - hunter-orin/models/UAV-YOLOv11m.onnx
+  - hunter-orin/models/UAV-YOLOv11m.pt
+
+Modeller (sha256):
+  32b29b148544122067008971e8eab97bc2275644f83ad7d0eed9ca4a5b63a5f7    36.2 MB  hunter-orin/models/yolo11s-plane-640x768.onnx
+  d2c69ae5d312297406efec94ea9eb994c494bf6b010ee9fd17a460737371b3ee    36.4 MB  hunter-orin/models/yolo11s-plane.pt
+
+Git'e girmeyen, bu Orin'de duran uretilmis dosyalar:
+  [engine] hunter-orin/models/ORTrack_ep0300-fp16.engine  17.8 MB  2026-10-22 08:04
+  [engine] hunter-orin/models/yolo11s-plane-640x768.engine  21.5 MB  2026-10-22 07:42
+  [engine] orin-tiled-tracker/UAV-YOLOv11m-768.engine  41.2 MB  2026-09-22 11:37
+  [onnx] orin-tiled-tracker/UAV-YOLOv11m-768.onnx  77.1 MB  2026-09-22 10:48
+  [engine] orin-tiled-tracker/UAV-YOLOv11m.engine  40.9 MB  2026-09-22 10:12
+  [onnx] orin-tiled-tracker/UAV-YOLOv11m.onnx  76.8 MB  2026-09-22 09:19
+  [arsiv] orin-tiled-tracker/cusparselt-local-tegra-repo-ubuntu2204-0.7.1_1.0-1_arm64.deb  5.3 MB  2025-02-15 22:06
+
+Sistem envanteri (ayrinti: sistem/envanter.txt; kopyalar ve tam liste yerel arsivde):
+  sistem dosyasi kopyasi (arsive): 102
+  ag: enP8p1s0(r8168) EEE=enabled - inactive, usb0(?) EEE=?, usb1(?) EEE=?   <-- EEE ACIK (SIYI link flap riski)
+  /usr/local/bin: ffmpeg (ffmpeg version 7.0.2-static https://john), ffprobe (ffprobe version 7.0.2-static https://joh)
+  ev dizini scripti: 2 (arsivde)
+  repo DISINDA kod/model klasoru: 19 (adlar arsivde)
+  Downloads: 41 teknik dosya/klasor
+  apt elle kurulan: 431 paket
+  jetson_clocks otomatik: YOK (her acilista elle)

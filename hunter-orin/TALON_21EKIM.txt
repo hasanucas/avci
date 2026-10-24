@@ -1,0 +1,25 @@
+TALON (SABIT KANAT) TESPIT — 21 Ekim 2026
+==========================================
+
+Bu arsiv hunter-orin klasorune acilir:
+  kcf/runtracker.cpp              --yolo-class bayragi + acilista yolo esikleri
+  kcf/yolo_trt.cpp                sinif sayisi MOTORDAN okunur, hedef sinif secilir
+  kcf/include/yolo_core.hpp       yoloResolveTargetClass(), yoloClassLabel()
+  kcf/include/yolo_trt.hpp        YoloOptions::targetClass (-1 = otomatik)
+  kcf/tests/test_yolo_offline.cpp 290 -> 324 kontrol (sinif secimi + tek sinifli motor)
+  scripts/build_yolo11s_plane_engine.sh   yolo11s-plane.pt -> ONNX 640x768 -> TensorRT fp16
+
+Davranis:
+  * 4 sinifli UAV-YOLOv11m motoru: hedef yine 2 (drone). Eski davranis birebir.
+  * 1 sinifli yolo11s-plane motoru: hedef 0 (plane).
+  * Baska sinif sayisi: --yolo-class N verilmezse runtracker YOLO'yu acmaz (net hata).
+
+Acilista beklenen satirlar:
+  UAV  : [YOLO] giris ...  sinif 4  hedef 2 (drone)  izgara ...
+  Talon: [YOLO] giris 640x768 (HxW)  sinif 1  hedef 0 (#0)  izgara 10080
+
+Derleme sonrasi test:
+  cd kcf/build && make tests && ctest --output-on-failure      -> 5/5
+  ./test_yolo_offline ../tests/yolo_golden.txt | tail -1       -> GECTI 324/324
+
+Adimlarin tamami sohbette.

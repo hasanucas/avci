@@ -153,7 +153,7 @@ target_include_directories(kcfTrackerLegacy PRIVATE
 #   ./test_yolo_offline    ../tests/yolo_golden.txt
 enable_testing()
 add_custom_target(tests)
-foreach(T test_ortrack_offline test_target_manager test_yolo_offline test_simple_lock)
+foreach(T test_ortrack_offline test_target_manager test_yolo_offline test_simple_lock test_roi_pointer)
     add_executable(${T} EXCLUDE_FROM_ALL tests/${T}.cpp)
     target_link_libraries(${T} PRIVATE ${OpenCV_LIBRARIES} pthread)
     target_include_directories(${T} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -163,6 +163,7 @@ add_test(NAME ortrack_core   COMMAND test_ortrack_offline ${CMAKE_CURRENT_SOURCE
 add_test(NAME target_manager COMMAND test_target_manager  ${CMAKE_CURRENT_SOURCE_DIR}/tests/manager_golden.txt)
 add_test(NAME yolo_core      COMMAND test_yolo_offline    ${CMAKE_CURRENT_SOURCE_DIR}/tests/yolo_golden.txt)
 add_test(NAME simple_lock    COMMAND test_simple_lock)
+add_test(NAME roi_pointer    COMMAND test_roi_pointer)     # [PTR] GUIDED imleci (8 Ekim)
 
 message(STATUS "")
 message(STATUS "===== HUNTER Orin build =====")

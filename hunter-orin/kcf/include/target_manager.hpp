@@ -91,6 +91,11 @@ struct ManagedTracker {
     // false = bu karede GECERLI kutu uretilemedi (py: result.valid == False)
     virtual bool track(const cv::Mat& frame, BoxF& box, float& score, float& rawScore) = 0;
     virtual void reset() = 0;
+    // [YO] Opsiyonel (YoloORTrack ORTrackBase.relocate): sablonu KORUYARAK bir
+    // sonraki aramayi bu kutuya ortala. Sadece yo::TargetManager kullanir; bu
+    // dosyadaki eski TargetManager hic cagirmaz. Desteklemeyen tracker false.
+    virtual bool canRelocate() const { return false; }
+    virtual bool relocate(const BoxF& /*box*/) { return false; }
 };
 
 struct Event {

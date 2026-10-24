@@ -1,4 +1,51 @@
 // =====================================================================
+// 14 EKIM — [KH] KUCUK HEDEF (gokte 2-3 px koyu hedef yayinda siliniyor / iz birakiyor)
+//  Teshis: x264 P-frame'de duz blokta kucuk farki atiyor (dct-decimate, fast-pskip);
+//  eski blok kopyalaninca iz kalir, intra-refresh gecince silinir. 1080p->720p
+//  kucultme de kontrasti yariya indirir. Kamera tarafinda 3DNR varsa ayni izi
+//  kaynakta uretir -> once hangi katman oldugu kayitlarla ayrilir (plan dokumani).
+//   --small-target        x264 option-string: dct-decimate=0 fast-pskip=0 aq-strength=1.3
+//   --x264-opts "a=1:b=0" ek x264 ayari, derlemeden deneme (deadzone-*, me, merange...)
+//   --inset [...]         hedef/ROI cevresini HAM 1080p'den kirpip buyuterek yayina bas
+//   cizim: dolu merkez dairesi ve tam arti KALKTI (hedefi kapatiyordu); kucuk kutu 2 px
+//   --file YOL            kamera yerine kayit (masa replay, gercek zamanli)
+//   --rec-raw YOL.ts      kaynak H.265'i tee ile oldugu gibi yaz (re-encode yok)
+//   --enhance [...]       kucuk koyu hedef GUCLENDIRICI (black-hat), sadece yayin kopyasinda,
+//                         kucultmeden once; sentetik testte 720p encoder sonrasi kontrast 13->36
+//   NOT: --small-target (x264 dct-decimate/fast-pskip/aq) sentetik testte FAYDA GOSTERMEDI,
+//        gurultulu kaynakta biraz kotulestirdi; deneme amacli duruyor, varsayilan KAPALI.
+//   rtcp_tick: birden cok alici varsa EN KOTU kayip orani (yerel kayit client'i maskelemesin)
+//  15 EKIM: [LINK] loss artik --auto-bitrate kapaliyken de olculur ("RR-yok" = alici RR
+//   yollamiyor); --rec-raw kayit kolu leaky (disk takilsa canli goruntu beklemez).
+//  15 EKIM-2: [LINK] satirina rtt / jit / rr (son RR yasi) eklendi (tezgah: SIYI UDP + RR yolluyor).
+//  Tracker / FRAME / RC / PTR mantigi DEGISMEDI.
+// =====================================================================
+// =====================================================================
+// 8 EKIM — [PTR] GUIDED IMLECI (follow_gps sirasinda elle hedef secimi)
+//  follow_gps takipciyi GUIDED'da ucururken FC sag cubugu yok sayar. FC
+//  GUIDED'dayken sag cubuk (CH1/CH2) secim kutusunu gezdirir (HIZ modu);
+//  CH8 pencere / CH13 boyut / CH12 kilit-birak KCF'dekiyle AYNI.
+//  Mantik + test: include/roi_pointer.hpp, tests/test_roi_pointer.cpp.
+//   - GUIDED DEGILKEN davranis BIREBIR eskisi: kutu ortada, cubuk kutuya
+//     bagli degil (test eski updateCenterRoi ile esitligi kilitliyor).
+//   - GUIDED'da kilit bitince kutu son takip noktasinda kalir; manuelde orta.
+//   - Mod degisince takip SURER, sadece cubuklar drone'a doner. GUIDED'dan
+//     takipsiz cikinca kutu ortaya doner (manuel KCF duzeni).
+//   - FC heartbeat / RC bayatsa kutu DONAR (ortaya ziplamaz).
+//   - --lock-snap DIR: her kilitte init karesi + init kutusu jpg (video
+//     gecikmesi kutuyu hedefin gerisinde birakiyor mu, sahada buradan bak).
+//   - OSD: GUIDED artik "GUID" (eskiden "MODE").
+//   - MAVLink msgid uint8'e kesiliyordu (MAVLink2'de id>255 mesajlar yanlis
+//     dala dusebilirdi) -> uint32. Normal akista davranis degismez.
+//  Bayraklar: --no-pointer --ptr-speed F --ptr-expo F --ptr-deadband US
+//             --ptr-center PWM --ptr-invert-x --ptr-invert-y --ptr-ch X Y
+//             --lock-snap DIR
+//  MASA DEMOSU: --ptr-demo (hep GUIDED taklidi) / --ptr-demo-ch N (CHN
+//             anahtari GUIDED'i taklit eder). GPS fix'siz masada FC GUIDED'a
+//             giremedigi icin. SADECE DISARM'da; arm edilince kendiliginden kapanir.
+//  FRAME protokolu DEGISMEDI. Dronu komutlayan sey yine sadece beyin (CH6).
+// =====================================================================
+// =====================================================================
 // 9 EYLUL — VIDEO/LINK SURUMU (1080p + uzun menzil)
 //  Amac: ayni link kapasitesinde daha az bitle daha iyi goruntu; uzakta kayip
 //  baslayinca BOZULMA / ILERI SARMA yerine YUMUSAMA; encoder yavaslarsa
@@ -80,6 +127,8 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <ctime>
+#include <filesystem>
 
 #include <termios.h>
 #include <unistd.h>
@@ -97,6 +146,8 @@
 
 // [ORT] Tracker arayuzu (KCF adaptorunu ve kcftracker.hpp'yi icerir)
 #include "tracker_backend.hpp"
+// [PTR] GUIDED imleci (OpenCV'siz, offline testli)
+#include "roi_pointer.hpp"
 #ifdef WITH_ORTRACK
 #include "ortrack_trt.hpp"
 #include "yolo_trt.hpp"
@@ -150,6 +201,7 @@ static double      g_ortMinBox   = 4.0;    // orin-camera-quality-768.yaml
 static int         g_ortLostLimit = 5;     // sadece MANUEL mod (hibritte manager karar verir)
 static bool        g_ortVerbose  = false;
 static float       g_yoloConf    = 0.35f;
+static int         g_yoloClass   = -1;     // [SK] --yolo-class N; -1 = otomatik (4 sinif->drone, 1 sinif->0)
 static float       g_yoloIoU     = 0.5f;
 static bool        g_hybDrawDets = false;  // --hyb-draw-dets
 static bool        g_procAtOut   = false;  // --proc-out : ESKI davranis
@@ -264,8 +316,50 @@ static bool        g_appsrcLeaky = false;     // appsrc leaky-type destegi (otom
 static std::atomic<bool>     g_autoBitrate{false};     // --auto-bitrate : RTCP kayip kontrolcusu
 static std::atomic<uint32_t> g_dropCount{0};           // encoder geride kaldiginda artar
 static std::atomic<int>      g_rtcpKbps{0};            // RTCP kontrolcusunun onerisi (0 = henuz yok)
-static std::atomic<int>      g_lastLossPermille{0};    // son RR kayip orani (binde)
+static std::atomic<int>      g_lastLossPermille{-1};   // son RR kayip orani (binde), -1 = bu oturumda RR hic gelmedi
+// [15 EKIM-2] RR'daki gecikme bilgisi. SIYI linki UDP + RR yolluyor (tezgahta dogrulandi).
+// Radyo katmani kayip yerine TAMPONLARSA (Eylul'deki "ileri sarma") belirti loss degil
+// rtt/jitter artisi olur; ucus logunda ikisini yan yana gormek icin.
+static std::atomic<int>      g_lastRttX10{-1};         // son RR round-trip (0.1 ms)
+static std::atomic<int>      g_lastJitX10{-1};         // son RR jitter (0.1 ms)
+static std::atomic<int64_t>  g_lastRrMs{0};            // son YENI RR zamani (steadyMs); yasi = yer->hava yonu tazeligi
 static std::atomic<int64_t>  g_lastRssiMs{0};          // son RC_CHANNELS zamani (0 = hic gelmedi)
+
+// ===== [KH] KUCUK HEDEF (14 Ekim) =====
+// Belirti: gokte 2-3 px'lik koyu hedef yayinda yanip sonuyor, arkasinda iz birakiyor.
+// Mekanizma: x264 P-frame'de duz blokta kucuk farki "onemsiz" sayip atiyor
+// (dct-decimate kucuk katsayilari siler, fast-pskip blogu erken "degismedi" sayar);
+// eski yerdeki blok kopyalandigi icin nokta orada kalir (iz), intra-refresh gecince silinir.
+// Ustune 1080p->720p kucultme noktanin kontrastini yariya indirir.
+static bool        g_smallTarget = false;   // --small-target : dct-decimate=0 fast-pskip=0 aq-strength=1.3
+static std::string g_x264Opts;              // --x264-opts "a=1:b=0" : x264 option-string'e ham gecer (deneme icin)
+static bool        g_inset       = false;   // --inset : hedef/ROI cevresini HAM kareden kirpip buyuterek yayina bas
+static int         g_insetCrop   = 96;      // --inset-crop N : kaynaktan kirpilan kare kenari (proc px)
+static int         g_insetSize   = 192;     // --inset-size N : yayin karesindeki buyutec kenari (px)
+static std::string g_insetPos    = "tl";    // --inset-pos tl|tr|bl|br (tl = rozetin alti, OSD'de bos bolge)
+static std::string g_inputFile;             // --file YOL : kamera yerine kayit oynat (masa replay: .mkv/.ts/.mp4)
+static std::string g_recRaw;                // --rec-raw YOL : kaynak H.265'i OLDUGU GIBI .ts'e yaz (tee, re-encode yok)
+// Kucuk koyu hedef GUCLENDIRICI (black-hat / top-hat: IR kucuk hedef literaturunun standardi).
+// Sadece YAYIN kopyasina uygulanir; tracker/YOLO temiz kareyi gorur. Parlak zemin (gok)
+// ustundeki, cekirdekten kucuk koyu ozellikleri bulur, koyulastirir ve 2x2 -> 4x4 buyutur;
+// boylece kucultme + encoder'dan sag cikar. Sentetik testte (2x2 px, kontrast 45, gurultu s=4,
+// 720p 4 Mbps) encoder sonrasi hedef kontrasti 13 -> 36, gorunur kare %21 -> %100.
+static bool  g_enhance   = false;   // --enhance
+static int   g_enhK      = 5;       // --enhance-k N    : cekirdek (px); hedef bundan KUCUK olmali, bulutlar buyuk kalir
+static int   g_enhTh     = 14;      // --enhance-th N   : gurultu tabani (0-255); gok benekleniyorsa artir
+static float g_enhGain   = 1.5f;    // --enhance-gain F : koyulastirma katsayisi
+static int   g_enhDil    = 3;       // --enhance-dil N  : yayilim (px): 2x2 hedef -> (2+N-1)^2
+static int   g_enhBright = 110;     // --enhance-bg N   : sadece bu parlakliktan ACIK zemin ustunde (gok/bulut)
+static float g_enhRows   = 0.70f;   // --enhance-rows F : karenin ust kismi (0-1); maliyet ve yer dokusu icin
+static bool  g_enhAtOut  = false;   // --enhance-at-out : kucultmeden SONRA uygula (ucuz; etkisi biraz az)
+
+// ===== [PTR] GUIDED imleci =====
+// g_fcMode/g_fcHbMs SADECE ana autopilot bileseninin (compid 1) heartbeat'inden
+// yazilir. Imlec kapisi buna bakar: GUIDED (4) degilse cubuk kutuya BAGLANMAZ.
+static ptr::Config           g_ptrCfg;
+static std::atomic<int>      g_fcMode{-1};       // son FC custom_mode (-1 = hic gelmedi)
+static std::atomic<int64_t>  g_fcHbMs{0};        // son FC heartbeat zamani (steadyMs, 0 = hic)
+static std::string           g_lockSnapDir;      // --lock-snap DIR (bos = kapali)
 
 // RSSI% -> bitrate katmanlari. down: bu katmandan ASAGI dusme esigi,
 // up: bu katmana YUKARI cikma esigi (histerezis). SAYILAR YER TUTUCU:
@@ -516,7 +610,9 @@ void mavlinkRcThread()
 
         for (int i = 0; i < n; ++i) {
             if (mavlink_parse_char(MAVLINK_COMM_0, buf[i], &msg, &status)) {
-                uint8_t mtype = msg.msgid;
+                // [PTR] uint8 idi: MAVLink2'de 255'ten buyuk id'ler kesilip
+                // baska bir mesajin dalina dusebilirdi (orn. 280 -> 24 GPS_RAW_INT).
+                const uint32_t mtype = msg.msgid;
 
                 auto now   = std::chrono::steady_clock::now();
                 auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastMsgTime).count();
@@ -559,7 +655,10 @@ void mavlinkRcThread()
                         std::cout << "[RC RATE] dt=" << dt_ms << " ms, "
                                   << "ch8="  << rc_values[7]
                                   << " ch12=" << rc_values[11]
-                                  << " ch13=" << rc_values[12] << std::endl;
+                                  << " ch13=" << rc_values[12]
+                                  // [PTR] tezgahta cubuk yonunu buradan dogrula
+                                  << " ptrX=" << rc_values[g_ptrCfg.chX - 1]
+                                  << " ptrY=" << rc_values[g_ptrCfg.chY - 1] << std::endl;
                         lastRatePrint = now2;
                     }
                 }
@@ -592,6 +691,11 @@ void mavlinkRcThread()
                     // armed=0 taşır → OSD STAB/disarmed ile gerçek mod arası TİTRER.
                     // GCS'lerde autopilot == MAV_AUTOPILOT_INVALID, onları atla.
                     if (hb.autopilot != MAV_AUTOPILOT_INVALID) {
+                        // [PTR] imlec kapisi: sadece ana autopilot bileseni
+                        if (msg.compid == MAV_COMP_ID_AUTOPILOT1) {
+                            g_fcMode = (int)hb.custom_mode;
+                            g_fcHbMs = steadyMs();
+                        }
                         std::lock_guard<std::mutex> lock(g_telemMutex);
                         g_telemetry.armed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
                         switch (hb.custom_mode) {
@@ -599,6 +703,7 @@ void mavlinkRcThread()
                             case 1:  g_telemetry.flight_mode = "ACRO"; break;
                             case 2:  g_telemetry.flight_mode = "ALTH"; break;
                             case 3:  g_telemetry.flight_mode = "AUTO"; break;
+                            case 4:  g_telemetry.flight_mode = "GUID"; break;   // [PTR] follow_gps
                             case 5:  g_telemetry.flight_mode = "LOIT"; break;
                             case 6:  g_telemetry.flight_mode = "RTL"; break;
                             case 9:  g_telemetry.flight_mode = "LAND"; break;
@@ -858,6 +963,8 @@ static void media_configure_cb(GstRTSPMediaFactory * /*factory*/,
     g_pts_base_us = -1;           // PTS bu pipeline icin sifirdan
     g_curKbps     = g_launchKbps; // yeni encoder launch degeriyle basladi
     g_rtcpKbps    = 0;            // RTCP onerisi ilk RR'a kadar yok
+    g_lastLossPermille = -1;      // [15 EKIM] yeni oturum: bayat kayip orani tasinmasin
+    g_lastRttX10 = -1; g_lastJitX10 = -1; g_lastRrMs = 0;
     g_dropCount   = 0;
 
     // NOT: set_reusable(TRUE) BILEREK YOK - reconnect fix'in cekirdegi.
@@ -876,11 +983,12 @@ static void media_configure_cb(GstRTSPMediaFactory * /*factory*/,
 // oranina gore ONERI uretir (g_rtcpKbps); uygulamayi ana dongu min() ile yapar.
 // Yeni RR gelmediyse (exthighestseq ayni) dokunmaz. Client hic RR yollamiyorsa
 // [RTCP] satiri hic gelmez -> RSSI/CH9 ile devam (sorun degil).
+// [15 EKIM] Kayip orani artik --auto-bitrate KAPALIYKEN de olculur ve [LINK] loss=
+// alanina yazilir (teshis ucusunda RF katmani icin gerekli; eskiden hep 0 gorunuyordu).
+// Oneri (g_rtcpKbps) ve [RTCP] satiri sadece --auto-bitrate acikken.
 static gboolean rtcp_tick(gpointer /*user_data*/)
 {
-    if (!g_autoBitrate.load()) return G_SOURCE_CONTINUE;
-
-    guint fracLost = 0, extSeq = 0, rtt = 0;
+    guint fracLost = 0, extSeq = 0, rtt = 0, jit = 0;
     gboolean haveRb = FALSE;
     int cur = 0;
     static bool dumped = false, typeWarned = false;
@@ -902,9 +1010,15 @@ static gboolean rtcp_tick(gpointer /*user_data*/)
                 gst_structure_get_boolean(s, "internal", &internal);
                 gst_structure_get_boolean(s, "have-rb", &rb);
                 if (!internal && rb) {   // uzak alici: bizim akisimiz hakkinda RR yollamis
-                    gst_structure_get_uint(s, "rb-fractionlost",  &fracLost);
-                    gst_structure_get_uint(s, "rb-exthighestseq", &extSeq);
-                    gst_structure_get_uint(s, "rb-round-trip",    &rtt);
+                    // [KH] Birden cok alici olabilir (SIYI + Orin'deki yerel kayit client'i):
+                    // EN KOTU kayip oranini alan belirler; yereldeki loss=0 raporu gercek
+                    // alicinin kaybini maskelemesin.
+                    guint fl = 0, es = 0, rt = 0, jt = 0;
+                    gst_structure_get_uint(s, "rb-fractionlost",  &fl);
+                    gst_structure_get_uint(s, "rb-exthighestseq", &es);
+                    gst_structure_get_uint(s, "rb-round-trip",    &rt);
+                    gst_structure_get_uint(s, "rb-jitter",        &jt);
+                    if (!haveRb || fl > fracLost) { fracLost = fl; extSeq = es; rtt = rt; jit = jt; }
                     haveRb = TRUE;
                     if (!dumped) {   // alan adlarini bir kez gor (surume gore dogrula)
                         gchar *txt = gst_structure_to_string(s);
@@ -930,6 +1044,10 @@ static gboolean rtcp_tick(gpointer /*user_data*/)
 
     float loss = fracLost / 256.0f;                     // son RR araligindaki kayip orani
     g_lastLossPermille = (int)(loss * 1000.0f);
+    g_lastRttX10 = (int)((double)rtt * 10000.0 / 65536.0);   // rb-round-trip: 1/65536 s birimi
+    g_lastJitX10 = (int)((double)jit * 10.0 / 90.0);         // rb-jitter: RTP saat birimi (H.264 = 90 kHz)
+    g_lastRrMs   = steadyMs();
+    if (!g_autoBitrate.load()) return G_SOURCE_CONTINUE;   // [15 EKIM] sadece olcum modu
     int target = cur;
     if      (loss > 0.05f)    { target = (int)(cur * 0.70f);            cleanRRs = 0; }  // agir kayip: sert kis
     else if (loss > 0.01f)    { target = (int)(cur * 0.90f);            cleanRRs = 0; }  // hafif kayip: yumusak kis
@@ -938,6 +1056,22 @@ static gboolean rtcp_tick(gpointer /*user_data*/)
     std::cout << "[RTCP] loss=" << loss * 100.0f << "%  rtt=" << rtt / 65.536f
               << " ms  oneri=" << g_rtcpKbps.load() << " kbps\n";
     return G_SOURCE_CONTINUE;
+}
+
+// [KH] x264enc'te property olmayan ayarlar option-string ile gecer (x264_param_parse).
+// Property'ler option-string'i EZER (gst dokumani), o yuzden buraya sadece property
+// olmayanlar yazilir: dct-decimate, fast-pskip, aq-strength, deadzone-*, me, merange...
+//   dct-decimate=0 : P-frame'de kucuk artik katsayilari SILME  (nokta kaybolmasin)
+//   fast-pskip=0   : blogu erken "degismedi" sayma           (iz / eski nokta kalmasin)
+//   aq-strength    : duz alanlara (gok) biraz daha bit (vars 1.0)
+// Bit maliyeti gok agirlikli sahnede kabaca %5-10; CPU'ya etkisi yok denecek kadar.
+static std::string x264OptionString()
+{
+    std::string o;
+    if (g_smallTarget) o = "dct-decimate=0:fast-pskip=0:aq-strength=1.3";
+    if (!g_x264Opts.empty()) { if (!o.empty()) o += ":"; o += g_x264Opts; }   // sonra gelen ezer
+    if (o.empty()) return "";
+    return "option-string=\"" + o + "\" ";
 }
 
 bool initRtspServer(int width, int height, int fps, int bitrateKbps)
@@ -1001,6 +1135,7 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
         << "sliced-threads=true "
         << "sync-lookahead=0 "
         << "rc-lookahead=0 "
+        << x264OptionString()                   // [KH] --small-target / --x264-opts (bossa hicbir sey)
 
         // ===== H.264 caps: AVC stream (Annex-B degil) =====
         << "! video/x-h264,profile=" << (g_mainProfile ? "main" : "baseline")
@@ -1062,6 +1197,10 @@ bool initRtspServer(int width, int height, int fps, int bitrateKbps)
               << (g_rssiAuto ? "RSSI " : "") << (g_autoBitrate.load() ? "RTCP " : "")
               << (g_chBitrate > 0 ? ("CH" + std::to_string(g_chBitrate) + " ") : "")
               << ((!g_rssiAuto && !g_autoBitrate.load() && g_chBitrate <= 0) ? "SABIT" : "") << "\n";
+    {
+        const std::string xo = x264OptionString();
+        std::cout << "  - x264 ekstra: " << (xo.empty() ? "yok" : xo) << "\n";
+    }
     std::cout << "=========================================\n";
 
     return true;
@@ -1153,6 +1292,135 @@ void shutdownRtsp()
     }
 }
 
+// ================= [KH] ORTASI BOS ARTI =================
+// Merkezden `gap` px uzakta baslayip `len` px suren dort cizgi: hedefin ustu acik kalir.
+static void drawGapCross(cv::Mat& img, cv::Point c, const cv::Scalar& col, int gap, int len, int th)
+{
+    cv::line(img, cv::Point(c.x - gap - len, c.y), cv::Point(c.x - gap, c.y), col, th, cv::LINE_AA);
+    cv::line(img, cv::Point(c.x + gap, c.y), cv::Point(c.x + gap + len, c.y), col, th, cv::LINE_AA);
+    cv::line(img, cv::Point(c.x, c.y - gap - len), cv::Point(c.x, c.y - gap), col, th, cv::LINE_AA);
+    cv::line(img, cv::Point(c.x, c.y + gap), cv::Point(c.x, c.y + gap + len), col, th, cv::LINE_AA);
+}
+
+// ================= [KH] KUCUK KOYU HEDEF GUCLENDIRICI =================
+// bgr'nin ust g_enhRows kismi YERINDE degistirilir. Adimlar:
+//   closing = dilate(erode) ile kucuk koyu seyler "dolar"; blackhat = closing - gri
+//   -> cekirdekten kucuk koyu ozelliklerin haritasi (nokta, ince hat); bulut kenari buyuk, tepki yok
+//   gurultu tabani (th) atilir, sadece parlak zemin maskesi, dil ile yayilir, gain ile koyulastirir.
+static void enhanceSmallDark(cv::Mat& bgr)
+{
+    if (bgr.empty() || bgr.type() != CV_8UC3) return;
+    const int rows = std::max(8, std::min(bgr.rows, (int)(bgr.rows * g_enhRows)));
+    cv::Mat roi = bgr.rowRange(0, rows);          // ust kisim, kopyasiz
+    static cv::Mat g, closing, bh, mask, boost, boost3;   // ayrik buffer'lar, her karede yeniden ayrilmaz
+    cv::cvtColor(roi, g, cv::COLOR_BGR2GRAY);
+    const cv::Mat k = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(g_enhK, g_enhK));
+    cv::morphologyEx(g, closing, cv::MORPH_CLOSE, k);
+    cv::subtract(closing, g, bh);                               // black-hat (>=0)
+    cv::subtract(bh, cv::Scalar::all(g_enhTh), bh);             // taban: 8U'da 0'a doyar
+    cv::compare(closing, g_enhBright, mask, cv::CMP_GT);        // parlak zemin: 255
+    cv::bitwise_and(bh, mask, bh);
+    if (g_enhDil > 1)
+        cv::dilate(bh, bh, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(g_enhDil, g_enhDil)));
+    bh.convertTo(boost, CV_8U, g_enhGain);                      // doyarak olceklenir
+    cv::cvtColor(boost, boost3, cv::COLOR_GRAY2BGR);
+    cv::subtract(roi, boost3, roi);                             // koyulastir (0'a doyar)
+}
+
+// ================= [KH] BUYUTEC (PiP) =================
+// Hedef/ROI cevresini CIZIMSIZ islem karesinden (proc, 1080p) kirpar, buyutur,
+// yayin karesine yapistirir. Kucultmeyi de encoder'i da atlar: 3 px'lik nokta
+// insette 6 px'lik leke olur, hicbir encoder onu silmez. Imlecle kutuyu hedefe
+// goturup kilitlerken de calisir (ROI gorunurken). Maliyet: bir crop + resize.
+static void drawInset(cv::Mat& display, const cv::Mat& proc, const cv::Rect& srcBox,
+                      const cv::Scalar& boxColor)
+{
+    const int pw = proc.cols, ph = proc.rows;
+    const int outW = display.cols, outH = display.rows;
+    int outSz = std::min(g_insetSize, std::min(outW, outH) / 3) & ~1;
+    if (outSz < 32 || pw < 8 || ph < 8) return;
+
+    // Kirpma karesi: en az --inset-crop, kutu buyukse kutunun 1.5 kati (hedef sigsin)
+    int crop = std::max(g_insetCrop, (int)lround(std::max(srcBox.width, srcBox.height) * 1.5));
+    crop = std::min(crop, std::min(pw, ph));
+    const int cx = srcBox.x + srcBox.width / 2, cy = srcBox.y + srcBox.height / 2;
+    const int x0 = std::max(0, std::min(cx - crop / 2, pw - crop));
+    const int y0 = std::max(0, std::min(cy - crop / 2, ph - crop));
+
+    const double z = (double)outSz / crop;
+    cv::Mat zoom;
+    cv::resize(proc(cv::Rect(x0, y0, crop, crop)), zoom, cv::Size(outSz, outSz), 0, 0,
+               z >= 1.5 ? cv::INTER_NEAREST : cv::INTER_AREA);   // nearest: nokta kati kalir
+
+    // Inset icinde kutu (ince) — hedefin kendisi acikta kalir
+    cv::Rect ib((int)lround((srcBox.x - x0) * z), (int)lround((srcBox.y - y0) * z),
+                std::max(2, (int)lround(srcBox.width * z)), std::max(2, (int)lround(srcBox.height * z)));
+    cv::rectangle(zoom, ib, boxColor, 1);
+
+    int px = 10, py = 40;                                   // tl: rozetin alti (OSD'de bos bolge)
+    if      (g_insetPos == "tr") { px = outW - outSz - 10; py = 40; }
+    else if (g_insetPos == "bl") { px = 10;                py = outH - outSz - 10; }
+    else if (g_insetPos == "br") { px = outW - outSz - 10; py = outH - outSz - 10; }
+    px = std::max(2, std::min(px, outW - outSz - 2));
+    py = std::max(2, std::min(py, outH - outSz - 2));
+
+    zoom.copyTo(display(cv::Rect(px, py, outSz, outSz)));
+    cv::rectangle(display, cv::Rect(px - 2, py - 2, outSz + 4, outSz + 4), cv::Scalar(0, 0, 0), 3);
+    cv::rectangle(display, cv::Rect(px - 2, py - 2, outSz + 4, outSz + 4), cv::Scalar(255, 255, 255), 1);
+
+    char lab[32];
+    std::snprintf(lab, sizeof(lab), "x%.1f", z);
+    cv::putText(display, lab, cv::Point(px + 4, py + outSz - 6), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(0, 0, 0), 3, cv::LINE_AA);
+    cv::putText(display, lab, cv::Point(px + 4, py + outSz - 6), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+}
+
+// ================= [PTR] KILIT ANI FOTOGRAFI =================
+// Init edilen KARE + init KUTUSU, isleme cozunurlugunde. Soru tek: CH12'ye
+// basildigi anda kutu gercekten hedefin ustunde miydi? Pilotun ekrani video
+// gecikmesi kadar eski; hedef ekranda hizli kayiyorsa kutu gerisinde kalir.
+// JPEG kodlama (~20 ms) ayri thread'de, ana dongu beklemez.
+static void saveLockSnap(const cv::Mat& proc, const cv::Rect& roi,
+                         bool pointer, long long frameNo)
+{
+    if (g_lockSnapDir.empty() || proc.empty()) return;
+    cv::Mat img = proc.clone();
+    // Cift cizgi (kalin siyah + ince sari): her zeminde gorunur. Tek renk
+    // kirmizi, kirmizi/koyu zeminde kayboluyordu (harness'te goruldu).
+    const cv::Point c(roi.x + roi.width / 2, roi.y + roi.height / 2);
+    cv::rectangle(img, roi, cv::Scalar(0, 0, 0), 4);
+    cv::rectangle(img, roi, cv::Scalar(0, 255, 255), 2);
+    cv::drawMarker(img, c, cv::Scalar(0, 0, 0), cv::MARKER_CROSS, 18, 4);
+    cv::drawMarker(img, c, cv::Scalar(0, 255, 255), cv::MARKER_CROSS, 16, 2);
+
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    const long ms = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now.time_since_epoch()).count() % 1000);
+    std::tm tmv{};
+    localtime_r(&tt, &tmv);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmv);
+    char name[128];
+    std::snprintf(name, sizeof(name), "lock_%s_%03ld_f%lld%s.jpg",
+                  ts, ms, frameNo, pointer ? "_imlec" : "_orta");
+
+    std::ostringstream lab;
+    lab << name << "  kutu " << roi.x << "," << roi.y << " " << roi.width << "x" << roi.height;
+    cv::putText(img, lab.str(), cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                cv::Scalar(0, 0, 0), 4, cv::LINE_AA);
+    cv::putText(img, lab.str(), cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+
+    const std::string path = g_lockSnapDir + "/" + name;
+    std::thread([img, path]() {
+        if (!cv::imwrite(path, img, {cv::IMWRITE_JPEG_QUALITY, 90}))
+            std::cerr << "[SNAP] yazilamadi: " << path << "\n";
+    }).detach();
+    std::cout << "[SNAP] " << path << "\n";
+}
+
 // ====================== MAIN =======================
 
 int main(int argc, char** argv)
@@ -1214,6 +1482,39 @@ int main(int argc, char** argv)
             g_rssiAuto = true;                    // RSSI katmanlari (g_tiers)
         } else if (!strcmp(argv[i], "--auto-bitrate")) {
             g_autoBitrate = true;                 // RTCP kayip kontrolcusu
+        // ---- [KH] kucuk hedef / kayit / replay ----
+        } else if (!strcmp(argv[i], "--small-target")) {
+            g_smallTarget = true;                 // x264: dct-decimate=0 fast-pskip=0 aq-strength=1.3
+        } else if (!strcmp(argv[i], "--x264-opts") && i+1 < argc) {
+            g_x264Opts = argv[++i];               // orn. "deadzone-inter=6:deadzone-intra=6"
+        } else if (!strcmp(argv[i], "--inset")) {
+            g_inset = true;
+        } else if (!strcmp(argv[i], "--inset-crop") && i+1 < argc) {
+            g_insetCrop = std::max(32, std::stoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--inset-size") && i+1 < argc) {
+            g_insetSize = std::max(64, std::stoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--inset-pos") && i+1 < argc) {
+            g_insetPos = argv[++i];               // tl | tr | bl | br
+        } else if (!strcmp(argv[i], "--file") && i+1 < argc) {
+            g_inputFile = argv[++i];              // masa: kamera yerine kayit
+        } else if (!strcmp(argv[i], "--rec-raw") && i+1 < argc) {
+            g_recRaw = argv[++i];                 // kaynak H.265 kopyasi (.ts)
+        } else if (!strcmp(argv[i], "--enhance")) {
+            g_enhance = true;                     // kucuk koyu hedef guclendirici (yayin kopyasi)
+        } else if (!strcmp(argv[i], "--enhance-k") && i+1 < argc) {
+            g_enhK = std::max(3, std::stoi(argv[++i]) | 1);      // tek sayi
+        } else if (!strcmp(argv[i], "--enhance-th") && i+1 < argc) {
+            g_enhTh = std::max(0, std::min(255, std::stoi(argv[++i])));
+        } else if (!strcmp(argv[i], "--enhance-gain") && i+1 < argc) {
+            g_enhGain = std::max(0.1f, std::stof(argv[++i]));
+        } else if (!strcmp(argv[i], "--enhance-dil") && i+1 < argc) {
+            g_enhDil = std::max(1, std::stoi(argv[++i]) | 1);
+        } else if (!strcmp(argv[i], "--enhance-bg") && i+1 < argc) {
+            g_enhBright = std::max(0, std::min(255, std::stoi(argv[++i])));
+        } else if (!strcmp(argv[i], "--enhance-rows") && i+1 < argc) {
+            g_enhRows = std::max(0.05f, std::min(1.0f, std::stof(argv[++i])));
+        } else if (!strcmp(argv[i], "--enhance-at-out")) {
+            g_enhAtOut = true;
         // ---- [1080] isleme/yayin ayrisimi ----
         } else if ((!strcmp(argv[i], "--out-width")) && i+1 < argc) {
             outWidth = std::stoi(argv[++i]);
@@ -1248,6 +1549,8 @@ int main(int argc, char** argv)
             g_yoloConf = std::stof(argv[++i]);
         } else if (!strcmp(argv[i], "--yolo-iou") && i+1 < argc) {
             g_yoloIoU = std::stof(argv[++i]);
+        } else if (!strcmp(argv[i], "--yolo-class") && i+1 < argc) {
+            g_yoloClass = std::stoi(argv[++i]);   // [SK] negatif = otomatik
         } else if (!strcmp(argv[i], "--box-smooth") && i+1 < argc) {
             g_boxSmooth = std::max(0, std::stoi(argv[++i]));
         } else if (!strcmp(argv[i], "--track-csv") && i+1 < argc) {
@@ -1390,6 +1693,31 @@ int main(int argc, char** argv)
 #else
             ++i;
 #endif
+        // ---- [PTR] GUIDED imleci ----
+        } else if (!strcmp(argv[i], "--no-pointer")) {
+            g_ptrCfg.enabled = false;
+        } else if (!strcmp(argv[i], "--ptr-speed") && i+1 < argc) {
+            g_ptrCfg.speed = std::max(0.01, std::stod(argv[++i]));
+        } else if (!strcmp(argv[i], "--ptr-expo") && i+1 < argc) {
+            g_ptrCfg.expo = std::min(1.0, std::max(0.0, std::stod(argv[++i])));
+        } else if (!strcmp(argv[i], "--ptr-deadband") && i+1 < argc) {
+            g_ptrCfg.deadband = std::max(0, std::stoi(argv[++i]));
+        } else if (!strcmp(argv[i], "--ptr-center") && i+1 < argc) {
+            g_ptrCfg.center = std::stoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--ptr-invert-x")) {
+            g_ptrCfg.invertX = true;
+        } else if (!strcmp(argv[i], "--ptr-invert-y")) {
+            g_ptrCfg.invertY = true;
+        } else if (!strcmp(argv[i], "--ptr-ch") && i+2 < argc) {
+            g_ptrCfg.chX = std::stoi(argv[++i]);
+            g_ptrCfg.chY = std::stoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--lock-snap") && i+1 < argc) {
+            g_lockSnapDir = argv[++i];
+        } else if (!strcmp(argv[i], "--ptr-demo")) {
+            g_ptrCfg.demo = true;                 // masa: hep GUIDED taklidi (sadece disarm)
+        } else if (!strcmp(argv[i], "--ptr-demo-ch") && i+1 < argc) {
+            g_ptrCfg.demo   = true;               // masa: CHN anahtari GUIDED'i taklit eder
+            g_ptrCfg.demoCh = std::stoi(argv[++i]);
         } else if (!strcmp(argv[i], "--help")) {
             std::cout <<
                 "Usage: " << argv[0]
@@ -1400,6 +1728,16 @@ int main(int argc, char** argv)
                 << "          [--preset superfast|veryfast|ultrafast] [--main] [--idr] [--udp-only]\n"
                 << "          [--br-min KBPS] [--br-max KBPS] [--ch-bitrate N] [--rssi-bitrate] [--auto-bitrate]\n"
                 << "  bitrate = min(RSSI katmani, RTCP onerisi, CHn tavani); hicbiri yoksa --bitrate sabit.\n"
+                << "  Kucuk hedef ([KH]):\n"
+                << "          [--small-target]             x264 dct-decimate=0 fast-pskip=0 aq-strength=1.3\n"
+                << "          [--x264-opts \"a=1:b=0\"]      ek x264 ayari (deneme; orn. deadzone-inter=6:deadzone-intra=6)\n"
+                << "          [--inset] [--inset-crop N] [--inset-size N] [--inset-pos tl|tr|bl|br]\n"
+                << "                                       hedef/ROI cevresini HAM 1080p'den kirpip buyuterek yayina bas\n"
+                << "          [--enhance]                  kucuk koyu hedef guclendirici (black-hat), SADECE yayin kopyasinda\n"
+                << "          [--enhance-k 5] [--enhance-th 14] [--enhance-gain 1.5] [--enhance-dil 3]\n"
+                << "          [--enhance-bg 110] [--enhance-rows 0.7] [--enhance-at-out]\n"
+                << "          [--file YOL]                 masa: kamera yerine kayit oynat (.mkv/.ts/.mp4, H.265)\n"
+                << "          [--rec-raw YOL.ts]           kaynak H.265'i oldugu gibi yaz (tee; CPU yok)\n"
                 << "  Cozunurluk ([1080]):\n"
                 << "          --width/--height veya --out-width/--out-height = YAYIN boyutu\n"
                 << "          isleme boyutu KAYNAKTAN gelir (1080p). --proc-out ile eski davranis.\n"
@@ -1420,6 +1758,8 @@ int main(int argc, char** argv)
                 << "          [--ortrack-min-box N]        kutu tabani (vars 4.0; eski 10.0)\n"
                 << "          [--ortrack-lost N]           MANUEL modda N gecersiz kare -> kilit duser\n"
                 << "          [--yolo-conf S] [--yolo-iou S]\n"
+                << "          [--yolo-class N]             hedef sinif (vars otomatik: 4 sinif->2 drone,\n"
+                << "                                       1 sinif (yolo11s-plane)->0)\n"
                 << "          [--hyb-legacy]               eski manager parametreleri\n"
                 << "          [--hyb-search-interval N] [--hyb-verify-interval N]\n"
                 << "          [--hyb-verify-miss-patience N] [--hyb-miss-patience N]\n"
@@ -1431,6 +1771,17 @@ int main(int argc, char** argv)
                 << "          [--box-smooth N]             kutu w/h icin N kareli MEDYAN (0 = kapali)\n"
                 << "          [--track-csv YOL]            kare kare CSV (ham VE yumusatilmis)\n"
                 << "          [--ortrack-verbose]\n"
+                << "  GUIDED imleci ([PTR], manuel KCF/ORTrack; FC GUIDED iken sag cubuk kutuyu surer):\n"
+                << "          [--no-pointer]               imleci kapat (GUIDED'da da kutu ortada)\n"
+                << "          [--ptr-speed F]              tam sapma hizi, kare genisligi/s (vars 0.5)\n"
+                << "          [--ptr-expo F]               0 dogrusal .. 1 kubik (vars 0.6)\n"
+                << "          [--ptr-deadband US]          orta olu bant, us (vars 30)\n"
+                << "          [--ptr-center PWM]           cubuk orta PWM (vars 1495)\n"
+                << "          [--ptr-invert-x] [--ptr-invert-y]   yon ters ise\n"
+                << "          [--ptr-ch X Y]               imlec kanallari (vars 1 2 = Mode 2 sag cubuk)\n"
+                << "          [--lock-snap DIR]            her kilitte init karesi + kutu jpg\n"
+                << "          [--ptr-demo]                 MASA: GPS'siz, FC modu yerine hep GUIDED (sadece disarm)\n"
+                << "          [--ptr-demo-ch N]            MASA: CHN >1600 GUIDED gibi, <1350 degil (sadece disarm)\n"
                 << "  Bayrak YOKSA KCF calisir.\n"
                 "Example (mavlink-router ile):\n"
                 "  " << argv[0]
@@ -1444,6 +1795,39 @@ int main(int argc, char** argv)
     if (g_brMin < 200)     g_brMin = 200;
     if (g_brMax < g_brMin) g_brMax = g_brMin;
 
+    // [PTR] imlec kanallari: 1..16, farkli, ve kontrol kanallarina BINMEZ
+    // (5 ucus modu, 6 otonom, 8 pencere, 10 EKF kaynagi, 11 ARM, 12 kilit,
+    //  13 boyut, 14 RSSI) — liste ptr::reservedChannel'da, testli.
+    {
+        if (ptr::reservedChannel(g_ptrCfg.chX) || ptr::reservedChannel(g_ptrCfg.chY) ||
+            g_ptrCfg.chX == g_ptrCfg.chY) {
+            std::cerr << "HATA: --ptr-ch " << g_ptrCfg.chX << " " << g_ptrCfg.chY
+                      << " gecersiz. 1..16, iki farkli kanal; 5/6/8/10/11/12/13/14 olamaz.\n";
+            return 1;
+        }
+        if (g_ptrCfg.demo && !g_ptrCfg.enabled) {
+            std::cerr << "HATA: --no-pointer ile --ptr-demo birlikte olmaz.\n";
+            return 1;
+        }
+        if (g_ptrCfg.demoCh != 0 &&
+            (ptr::reservedChannel(g_ptrCfg.demoCh) || g_ptrCfg.demoCh == g_ptrCfg.chX ||
+             g_ptrCfg.demoCh == g_ptrCfg.chY)) {
+            std::cerr << "HATA: --ptr-demo-ch " << g_ptrCfg.demoCh
+                      << " gecersiz. Bos bir anahtar ver (orn. 9); imlec kanallari ve "
+                         "5/6/8/10/11(ARM)/12/13/14 olamaz.\n";
+            return 1;
+        }
+    }
+    if (!g_lockSnapDir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(g_lockSnapDir, ec);
+        if (ec) {
+            std::cerr << "[SNAP] klasor acilamadi: " << g_lockSnapDir << " (" << ec.message()
+                      << ") -> kilit fotografi KAPALI\n";
+            g_lockSnapDir.clear();
+        }
+    }
+
     std::cout << "=== RTSP + MAVLink TRACKER (RTSP OUT + TCP FRAME) ===\n";
     std::cout << "Tracker : " << (g_detectOnly ? "DETECT-ONLY (sadece YOLO, tracker YOK)"
                                 : g_hybridKcf ? "HYBRID-KCF (YOLO + KCF)"
@@ -1454,7 +1838,10 @@ int main(int argc, char** argv)
         if (g_useOrtrack || g_hybrid)
             std::cout << "  ortrack : " << g_ortEngine << "  (" << ortrack::tensorrtBuildInfo() << ")\n";
         if (g_hybrid || g_hybridKcf || g_detectOnly)
-            std::cout << "  yolo    : " << g_yoloEngine << "\n";
+            std::cout << "  yolo    : " << g_yoloEngine
+                      << "  conf=" << g_yoloConf << " iou=" << g_yoloIoU
+                      << " sinif=" << (g_yoloClass < 0 ? std::string("otomatik") : std::to_string(g_yoloClass))
+                      << "\n";
         std::cout << "  min-box=" << g_ortMinBox
                   << "  min-score=" << g_ortMinScore << (g_ortMinScore > 0.0f ? "" : " (kapali)")
                   << "  lost-limit=" << g_ortLostLimit << "\n";
@@ -1491,7 +1878,23 @@ int main(int argc, char** argv)
     if (g_hybrid || g_hybridKcf || g_useOrtrack || g_detectOnly)
         std::cout << "  !!! Bu ikili WITH_ORTRACK=OFF ile derlendi — KCF kullanilacak.\n";
 #endif
-    std::cout << "RTSP IN  : " << rtspUrl    << "\n";
+    if (!g_inputFile.empty())
+        std::cout << "GIRIS    : KAYIT " << g_inputFile << "  (--file: masa replay, gercek zamanli hiz)\n";
+    else
+        std::cout << "RTSP IN  : " << rtspUrl << (g_recRaw.empty() ? "" : "  -> ham kopya: " + g_recRaw) << "\n";
+    if (g_inset) {
+        std::ostringstream is;   // cout'un formatini kalici degistirmemek icin ayri akis
+        is << "Buyutec  : " << g_insetPos << " kirp=" << g_insetCrop << "px -> " << g_insetSize
+           << "px (" << std::fixed << std::setprecision(1) << (double)g_insetSize / g_insetCrop << "x)\n";
+        std::cout << is.str();
+    }
+    if (g_enhance) {
+        std::ostringstream es;
+        es << "Guclendir: k=" << g_enhK << " th=" << g_enhTh << " gain=" << std::fixed << std::setprecision(2)
+           << g_enhGain << " dil=" << g_enhDil << " bg>" << g_enhBright << " rows=" << g_enhRows
+           << (g_enhAtOut ? " (kucultme SONRASI)" : " (kucultme ONCESI, 1080p)") << "  [sadece yayin kopyasi]\n";
+        std::cout << es.str();
+    }
     if (g_useUdp)
         std::cout << "MAVLink  : UDP " << mavlinkUdp << " (mavlink-router)\n";
     else
@@ -1505,7 +1908,26 @@ int main(int argc, char** argv)
               << " bitrate=" << outBitrateKbps << " [" << g_brMin << ".." << g_brMax << "]"
               << (g_rssiAuto ? " +rssi" : "") << (g_autoBitrate.load() ? " +rtcp" : "")
               << (g_chBitrate > 0 ? " +ch" + std::to_string(g_chBitrate) : "")
-              << (g_udpOnly ? " udp-only" : "") << "\n\n";
+              << (g_udpOnly ? " udp-only" : "") << "\n";
+    if (g_ptrCfg.enabled)
+        std::cout << "Imlec    : ACIK — FC GUIDED iken sag cubuk (CH" << g_ptrCfg.chX << "/CH"
+                  << g_ptrCfg.chY << ") kutuyu surer. hiz=" << g_ptrCfg.speed
+                  << " expo=" << g_ptrCfg.expo << " olu=" << g_ptrCfg.deadband
+                  << " orta=" << g_ptrCfg.center
+                  << (g_ptrCfg.invertX ? " ters-x" : "") << (g_ptrCfg.invertY ? " ters-y" : "")
+                  << "  (sadece manuel KCF/ORTrack)\n";
+    else
+        std::cout << "Imlec    : KAPALI (--no-pointer)\n";
+    if (g_ptrCfg.demo) {
+        std::cout << "!!! IMLEC MASA DEMOSU: FC modu yok sayiliyor, ";
+        if (g_ptrCfg.demoCh > 0)
+            std::cout << "CH" << g_ptrCfg.demoCh << " >1600 = GUIDED taklidi, <1350 = pilot geri aldi.\n";
+        else
+            std::cout << "hep GUIDED taklidi.\n";
+        std::cout << "!!! Sadece DISARM'dayken. Arm edilince demo kapanir, gercek kural (FC GUIDED) gecerli.\n";
+    }
+    std::cout << "Kilit jpg: " << (g_lockSnapDir.empty() ? std::string("KAPALI (--lock-snap DIR)")
+                                                         : g_lockSnapDir) << "\n\n";
 
     std::signal(SIGINT, signalHandler);
 
@@ -1545,11 +1967,36 @@ int main(int argc, char** argv)
     // fpsdisplaysink/autovideosink (headless display yok) yuzundendi; appsink
     // ve fakesink ile donanim decode sorunsuz calisiyor (Test 3/4 ile kanitli).
     // nvv4l2decoder -> NV12/NVMM -> nvvidconv -> BGRx (sistem mem) -> videoconvert -> BGR.
-    std::string gstIn =
-    "rtspsrc location=" + rtspUrl + " protocols=udp latency=0 ! "
-    "rtph265depay ! h265parse ! nvv4l2decoder ! "
-    "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! "
-    "appsink caps=video/x-raw,format=BGR sync=false max-buffers=1 drop=true";
+    // [KH] Uc giris sekli:
+    //  1) kamera (eskisi gibi)
+    //  2) kamera + --rec-raw: h265parse'tan sonra tee, ikinci kol MPEG-TS'e yazar.
+    //     Re-encode YOK, CPU maliyeti yok; .ts EOS gerektirmez (Ctrl+C'de dosya saglam).
+    //     [15 EKIM] Kayit kolu LEAKY: disk takilirsa kayitta bosluk olur, CANLI goruntu
+    //     ASLA beklemez. Decode kolu kucuk ve leaky DEGIL (sikistirilmis kare atmak
+    //     referans zincirini bozar); eski dogrudan baglantiyla ayni geri-basinc.
+    //     Alternatif: ayri surecte gst-launch ile R1M'e ikinci client (bkz. plan dokumani).
+    //  3) --file: kayit oynat. sync=true -> dosya gercek zamanli akar, encoder ucustaki
+    //     gibi 30 fps gorur; drop=false -> kare atlanmaz (masada CPU rahat).
+    std::string gstIn;
+    if (!g_inputFile.empty()) {
+        gstIn =
+        "filesrc location=" + g_inputFile + " ! parsebin ! nvv4l2decoder ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! "
+        "appsink caps=video/x-raw,format=BGR sync=true max-buffers=1 drop=false";
+    } else {
+        gstIn =
+        "rtspsrc location=" + rtspUrl + " protocols=udp latency=0 ! "
+        "rtph265depay ! h265parse ! " +
+        (g_recRaw.empty() ? std::string()
+                          : std::string("tee name=rawt ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 ! ")) +
+        "nvv4l2decoder ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! "
+        "appsink caps=video/x-raw,format=BGR sync=false max-buffers=1 drop=true" +
+        (g_recRaw.empty() ? std::string()
+                          : std::string(" rawt. ! queue leaky=downstream max-size-buffers=0 max-size-bytes=0 "
+                                        "max-size-time=3000000000 ! mpegtsmux ! filesink async=false location=")
+                            + g_recRaw);
+    }
 
     cv::VideoCapture cap(gstIn, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
@@ -1651,6 +2098,7 @@ int main(int argc, char** argv)
         y.enginePath = g_yoloEngine;
         y.confidence = g_yoloConf;
         y.nmsIoU     = g_yoloIoU;
+        y.targetClass = g_yoloClass;   // [SK]
         y.verbose    = g_ortVerbose;
         std::string err;
         hybYolo = hybrid::makeYoloTensorRT(y, err);
@@ -1705,6 +2153,16 @@ int main(int argc, char** argv)
     tracker = makeKcfTracker();
 #endif
 
+    // [PTR] Imlec SADECE manuel yolda (KCF / manuel ORTrack) anlamli. Hibrit ve
+    // tespit modlarinda hedefi makine seciyor; orada kapi hep OFF.
+#ifdef WITH_ORTRACK
+    const bool manualPath = !((g_detectOnly && slkDet) || slk || hybMgr);
+#else
+    const bool manualPath = true;
+#endif
+    if (g_ptrCfg.enabled && !manualPath)
+        std::cout << "[PTR] hibrit/tespit modunda imlec ETKISIZ (hedefi makine seciyor)\n";
+
     bool trackingActive = false;
     bool roiVisible     = false;
     int  lostStreak     = 0;   // [ORT] ardisik gecersiz kare (KCF yolunda HEP 0)
@@ -1739,14 +2197,27 @@ int main(int argc, char** argv)
     const int MIN_ROI_SIZE = std::max(6, (int)lround(20.0  * roiK));
     const int MAX_ROI_SIZE = std::max(roiBase, (int)lround(150.0 * roiK));
     const int roiStep      = std::max(1, (int)lround(4.0   * roiK));
-    int roiSize = roiBase;
+    // [PTR] Secim kutusu artik ptr::SelectBox'ta (merkez + boyut). Imlec hic
+    // oynamadiysa kutu eski updateCenterRoi() ile BIREBIR ayni
+    // (tests/test_roi_pointer.cpp "manuel uyum" bunu kilitliyor).
+    const float kSafeMarginRatio = 0.075f;     // (100-85)/2 — asagidaki guvenli alanla AYNI
+    ptr::SelectBox sel;
+    int selW = procW, selH = procH;
+    sel.setup(selW, selH, kSafeMarginRatio, roiBase, MIN_ROI_SIZE, MAX_ROI_SIZE, roiStep);
     cv::Rect roiRect;
+    auto syncRoi = [&]() { roiRect = cv::Rect(sel.x(), sel.y(), sel.size(), sel.size()); };
+    syncRoi();
 
-    auto updateCenterRoi = [&](int w, int h){
-        int half = roiSize / 2;
-        roiRect  = cv::Rect(w / 2 - half, h / 2 - half, roiSize, roiSize);
-    };
-    updateCenterRoi(procW, procH);
+    ptr::Gate ptrGate     = ptr::Gate::Off;
+    ptr::Gate ptrPrevGate = ptr::Gate::Off;
+    long long ptrLastNs   = 0;
+    // [PTR] masa demosu: anahtarli demoda baslangic "GUIDED degil"
+    int       ptrDemoMode = (g_ptrCfg.demoCh > 0) ? 0 : ptr::MODE_GUIDED;
+    bool      ptrDemoNow  = false;     // bu karede demo etkin mi (demo bayragi + disarm)
+    bool      ptrDemoPrev = false;
+    int       ptrModeEff  = -1;        // kapiya verilen mod (log icin)
+    bool      haveLastTrk = false;     // son GECERLI takip merkezi (kilit bitince imlec oraya)
+    double    lastTrkCx   = 0.0, lastTrkCy = 0.0;
 
     std::cout << "Isleme    : " << procW << "x" << procH
               << (g_procAtOut ? "  (--proc-out: yayin cozunurlugunde)" : "  (kaynak cozunurlugu)")
@@ -1755,15 +2226,16 @@ int main(int argc, char** argv)
               << "  max " << MAX_ROI_SIZE << "  adim " << roiStep << "\n";
 
 
-    std::cout << "=== RC Kontrolleri ===\n";
-    std::cout << "CH13 <1350 : center box AÇ (MAVİ)\n";
-    std::cout << "CH13 >1600 : center box KAPAT\n";
-    std::cout << "CH12 <1330 : box sürekli küçült (basılı tut)\n";
-    std::cout << "CH12 >1650 : box sürekli büyüt (basılı tut, max 150x150)\n";
-    std::cout << "CH5  low   : tracker DUR\n";
-    std::cout << "CH5  high  : tracker BAŞLAT (kutu TURUNCU olur)\n";
-    std::cout << "ROI Başlangıç: 50x50 (mavi)\n";
-    std::cout << "Ctrl+C     : çıkış\n";
+    // [PTR] Eski metin CH13/CH12/CH5 diyordu; kod CH8/CH13/CH12 kullaniyor. Duzeltildi.
+    std::cout << "=== RC Kontrolleri (manuel KCF/ORTrack) ===\n";
+    std::cout << "CH8  basili (>1600) : pencere AC, kutu ortada  | birak (<1350): KAPAT\n";
+    std::cout << "CH13 >1650 / <1330  : kutu buyut / kucult (basili tut)\n";
+    std::cout << "CH12 ileri (>1650)  : o kutuda KILITLE\n";
+    std::cout << "CH12 geri  (<1350)  : kilidi BIRAK\n";
+    if (g_ptrCfg.enabled)
+        std::cout << "FC GUIDED iken      : sag cubuk kutuyu gezdirir (hiz modu)\n";
+    std::cout << "CH5 = ucus modu (FC). Tracker okumaz.\n";
+    std::cout << "Ctrl+C              : cikis\n";
 
     while (keepRunning.load()) {
         if (!cap.read(frame) || frame.empty()) {
@@ -1815,15 +2287,73 @@ int main(int argc, char** argv)
         RcControl rcCtrl;
         readRcControl(rcCtrl);
 
+        // ===== [PTR] IMLEC KAPISI (her kare) =====
+        // OFF: FC GUIDED degil -> eski davranis. LIVE: sag cubuk kutuyu surer.
+        // FROZEN: GUIDED ama heartbeat/RC bayat -> kutu yerinde donar.
+        if (pw != selW || ph != selH) {          // ayni akista olmaz; olursa yeniden kur
+            selW = pw; selH = ph;
+            sel.setup(selW, selH, kSafeMarginRatio, roiBase, MIN_ROI_SIZE, MAX_ROI_SIZE, roiStep);
+            syncRoi();
+        }
+        int ptrPwmX = 0, ptrPwmY = 0;
+        {
+            std::lock_guard<std::mutex> lock(rcMutex);
+            ptrPwmX = rc_values[g_ptrCfg.chX - 1];
+            ptrPwmY = rc_values[g_ptrCfg.chY - 1];
+        }
+        {
+            const int64_t nowMs = steadyMs();
+            const int64_t hbMs  = g_fcHbMs.load();
+            const int64_t rcMs  = g_lastRssiMs.load();   // son RC_CHANNELS(_RAW) zamani
+            int64_t hbAge = hbMs ? nowMs - hbMs : -1;
+            ptrModeEff = g_fcMode.load();
+            // [PTR] MASA DEMOSU: FC modu yerine sahte GUIDED — SADECE DISARM'da.
+            bool armed;
+            { std::lock_guard<std::mutex> lock(g_telemMutex); armed = g_telemetry.armed; }
+            ptrDemoNow = ptr::demoActive(g_ptrCfg, armed);
+            if (ptrDemoNow) {
+                int demoPwm = 0;
+                if (g_ptrCfg.demoCh > 0) {
+                    std::lock_guard<std::mutex> lock(rcMutex);
+                    demoPwm = rc_values[g_ptrCfg.demoCh - 1];
+                }
+                ptrDemoMode = ptr::demoEffectiveMode(g_ptrCfg, demoPwm, ptrDemoMode);
+                ptrModeEff  = ptrDemoMode;
+                hbAge       = 0;          // masada FC modu onemsiz; RC tazeligi yine sart
+            }
+            if (ptrDemoNow != ptrDemoPrev) {
+                if (g_ptrCfg.demo)
+                    std::cout << "[PTR] MASA DEMOSU " << (ptrDemoNow ? "ACIK (disarm)"
+                              : "KAPALI — FC ARM edildi, gercek kural (FC GUIDED)") << "\n";
+                ptrDemoPrev = ptrDemoNow;
+            }
+            ptrGate = !manualPath ? ptr::Gate::Off
+                    : ptr::gate(g_ptrCfg, ptrModeEff, hbAge,
+                                rcMs ? nowMs - rcMs : -1,
+                                ptrPwmX, ptrPwmY);
+        }
+        if (ptrGate != ptrPrevGate) {
+            std::cout << "[PTR] imlec " << ptr::gateName(ptrPrevGate) << " -> "
+                      << ptr::gateName(ptrGate) << "  (" << (ptrDemoNow ? "DEMO" : "FC")
+                      << " mod=" << ptrModeEff
+                      << (trackingActive ? ", takip SURUYOR" : "") << ")\n";
+            if (ptr::shouldRecenter(ptrPrevGate, ptrGate, trackingActive)) {
+                sel.recenter();
+                syncRoi();
+                std::cout << "[PTR] GUIDED bitti -> kutu ortaya (manuel KCF duzeni)\n";
+            }
+            ptrPrevGate = ptrGate;
+        }
+
         if (!trackingActive) {
             if (rcCtrl.roi_visible && !roiVisible) {
                 roiVisible = true;
-                roiSize = roiBase;   // [1080] k ile olcekli taban  // Her açılışta 50x50'den başla
-                updateCenterRoi(pw, ph);
-                std::cout << "ROI visible (CH13) - Size: \n";
+                sel.open();                       // her acilista ortada + taban boyut (eskisi gibi)
+                syncRoi();
+                std::cout << "ROI visible (CH8) - Size: " << sel.size() << "\n";
             } else if (!rcCtrl.roi_visible && roiVisible) {
                 roiVisible = false;
-                std::cout << "ROI hidden (CH13)\n";
+                std::cout << "ROI hidden (CH8)\n";
             }
         }
 
@@ -1831,14 +2361,25 @@ int main(int argc, char** argv)
             static auto lastResizeTime = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastResizeTime).count();
-            
+
             // 150ms'de 5 piksel artış/azalış (saniyede ~33 piksel)
             if (elapsed >= 60) {
-                roiSize += rcCtrl.resize_dir * roiStep;   // [1080] k ile olcekli
-                roiSize = std::max(MIN_ROI_SIZE, std::min(roiSize, MAX_ROI_SIZE));
-                updateCenterRoi(pw, ph);
+                sel.resize(rcCtrl.resize_dir);    // [1080] k ile olcekli adim; [PTR] merkez KORUNUR
+                syncRoi();
                 lastResizeTime = now;
-                std::cout << "ROI size: " << roiSize << "x" << roiSize << "\n";
+                std::cout << "ROI size: " << sel.size() << "x" << sel.size() << "\n";
+            }
+        }
+
+        // [PTR] Sag cubuk -> kutu (hiz modu). Sadece LIVE + pencere acik + takip yok.
+        // dt gercek kare periyodu; SelectBox 0.1 s'ye kirpar (takilmada ziplamaz).
+        {
+            const long long tNs = steadyNs();
+            const double dtS = ptrLastNs ? (double)(tNs - ptrLastNs) / 1e9 : 0.0;
+            ptrLastNs = tNs;
+            if (ptrGate == ptr::Gate::Live && roiVisible && !trackingActive) {
+                sel.step(dtS, ptrPwmX, ptrPwmY, g_ptrCfg);
+                syncRoi();
             }
         }
 
@@ -1864,7 +2405,7 @@ int main(int argc, char** argv)
         double curTrkMs = 0.0;
 
         // ---- guvenli alan (oransal, cozunurlukten BAGIMSIZ)
-        const float safeMarginRatio = 0.075f;      // (100-85)/2
+        const float safeMarginRatio = kSafeMarginRatio;   // (100-85)/2 — [PTR] imlec siniri da bu
         const int   marginX = (int)(pw * safeMarginRatio);
         const int   marginY = (int)(ph * safeMarginRatio);
         const int   minX = marginX, maxX = pw - marginX;
@@ -2121,10 +2662,16 @@ int main(int argc, char** argv)
             // ===================== MANUEL: RC + ROI (KCF veya ORTrack) ========
             if (rcCtrl.tracker_start) {
                 if (roiVisible && !trackingActive) {
+                    const bool viaPointer = (ptrGate != ptr::Gate::Off);
                     if (tracker->init(proc, roiRect)) {
                         trackingActive = true;
                         lostStreak     = 0;
-                        std::cout << "TRACKING STARTED (" << tracker->name() << ")\n";
+                        haveLastTrk    = false;
+                        std::cout << "TRACKING STARTED (" << tracker->name() << ")"
+                                  << (viaPointer ? " [IMLEC]" : "")
+                                  << "  kutu=" << roiRect.x << "," << roiRect.y << " "
+                                  << roiRect.width << "x" << roiRect.height << "\n";
+                        saveLockSnap(proc, roiRect, viaPointer, frameCounter);   // [PTR]
                     } else {
                         std::cout << "TRACKING START FAILED (" << tracker->name()
                                   << ") - ROI gecersiz\n";
@@ -2137,9 +2684,15 @@ int main(int argc, char** argv)
                     lostStreak     = 0;
                     tracker->reset();
                     roiVisible     = true;
-                    roiSize = roiBase;
-                    updateCenterRoi(pw, ph);
-                    std::cout << "TRACKING STOPPED - ROI reset\n";
+                    if (ptr::keepAtLastTrack(ptrGate) && haveLastTrk) {
+                        // [PTR] GUIDED: kutu son takip noktasinda kalir, yeniden kilit kolay
+                        sel.moveTo(lastTrkCx, lastTrkCy);
+                        std::cout << "TRACKING STOPPED - kutu son takip noktasinda (imlec)\n";
+                    } else {
+                        sel.resetBase();          // eski davranis: orta + taban boyut
+                        std::cout << "TRACKING STOPPED - ROI reset\n";
+                    }
+                    syncRoi();
                 }
             }
 
@@ -2161,7 +2714,14 @@ int main(int argc, char** argv)
                     lostStreak = 0;
                     tracker->reset();
                     roiVisible = true;
-                    updateCenterRoi(pw, ph);
+                    if (ptr::keepAtLastTrack(ptrGate)) {
+                        // [PTR] GUIDED: son GECERLI noktaya (guvenli alana kirpilir)
+                        if (lockLost && haveLastTrk) sel.moveTo(lastTrkCx, lastTrkCy);
+                        else                         sel.moveTo(bcx, bcy);
+                    } else {
+                        sel.recenter();               // eski davranis: orta, boyut ayni
+                    }
+                    syncRoi();
                     frameState = "lost";
                     std::cout << "TRACKING AUTO-STOPPED: "
                               << (lockLost ? "tracker gecersiz kare siniri asildi"
@@ -2177,6 +2737,9 @@ int main(int argc, char** argv)
                     fcy = (float)bcy / (float)ph;
                     fbw = (float)trackedBox.width  / (float)pw;
                     fbh = (float)trackedBox.height / (float)ph;
+                    if (frameOk) {                    // [PTR] son GECERLI takip merkezi
+                        lastTrkCx = bcx; lastTrkCy = bcy; haveLastTrk = true;
+                    }
                 }
             } else if (roiVisible) {
                 drawRoi = true;
@@ -2190,7 +2753,13 @@ int main(int argc, char** argv)
                     if (sc >= 0.0f) b << std::fixed << std::setprecision(2) << "  s=" << sc;
                     b << std::fixed << std::setprecision(1) << "  " << tracker->lastMs() << "ms";
                     if (lostStreak > 0) b << "  miss" << lostStreak;
+                } else if (ptrGate == ptr::Gate::Live) {
+                    b << "  IMLEC";                   // [PTR] sag cubuk kutuyu suruyor
+                } else if (ptrGate == ptr::Gate::Frozen) {
+                    b << "  IMLEC-BEKLE";             // [PTR] GUIDED ama FC/RC verisi bayat
                 }
+                if (ptrDemoNow && !trackingActive)                 // [PTR] masa demosu
+                    b << (ptrGate == ptr::Gate::Off ? "  DEMO" : "-DEMO");
                 g_badge = b.str();
                 g_badgeActive = trackingActive;
             }
@@ -2243,14 +2812,26 @@ int main(int argc, char** argv)
         // [1080] YAYIN KARESI — isleme bitti, simdi kucult ve CIZ
         // =============================================================
         cv::Mat display;
+        // [KH] Guclendirici KUCULTMEDEN ONCE (varsayilan): 2x2 px hedef 1080p'de bulunur,
+        // buyutulur, sonra INTER_AREA ile 720p'ye iner ama kontrasti korur. proc'a dokunulmaz.
+        const bool enhBefore = g_enhance && !g_enhAtOut;
         if (pw != outWidth || ph != outHeight) {
             // INTER_AREA: alan ortalamasi yuksek frekansli gurultuyu siler,
             // encoder ayni bitrate'te daha temiz goruntu uretir.
-            cv::resize(proc, display, cv::Size(outWidth, outHeight), 0, 0, cv::INTER_AREA);
+            if (enhBefore) {
+                static cv::Mat bcast;                 // yayin kopyasi (1080p), buffer yeniden kullanilir
+                proc.copyTo(bcast);
+                enhanceSmallDark(bcast);
+                cv::resize(bcast, display, cv::Size(outWidth, outHeight), 0, 0, cv::INTER_AREA);
+            } else {
+                cv::resize(proc, display, cv::Size(outWidth, outHeight), 0, 0, cv::INTER_AREA);
+            }
         } else {
             // proc == frame (capture buffer). Uzerine cizmek YASAK -> kopya sart.
             display = proc.clone();
+            if (enhBefore) enhanceSmallDark(display);
         }
+        if (g_enhance && g_enhAtOut) enhanceSmallDark(display);   // ucuz varyant: kucultme sonrasi
 
         const double sx = (double)outWidth  / (double)pw;
         const double sy = (double)outHeight / (double)ph;
@@ -2275,13 +2856,25 @@ int main(int argc, char** argv)
         for (const cv::Rect& d : detBoxesP)
             cv::rectangle(display, S(d), cv::Scalar(0, 220, 0), 1, cv::LINE_AA);
         if (drawCand) cv::rectangle(display, S(candBoxP), cv::Scalar(0, 255, 255), 2);
+        // [KH] Cizim hedefi KAPATMASIN: eski dolu merkez dairesi (8 px disk) ve tam arti,
+        // 720p'de 2-3 px'lik hedefin tam ustune geliyordu. Kucuk kutuda cerceve 2 px,
+        // merkez isareti sadece buyuk kutuda ve ortasi BOS arti.
         if (drawTrk) {
             const cv::Rect db = S(trkBoxP);
-            cv::rectangle(display, db, trkColor, 4);
-            cv::circle(display, cv::Point(db.x + db.width / 2, db.y + db.height / 2),
-                       4, trkColor, -1);
+            const bool small = (db.width < 40 || db.height < 40);
+            cv::rectangle(display, db, trkColor, small ? 2 : 4);
+            if (!small)
+                drawGapCross(display, cv::Point(db.x + db.width / 2, db.y + db.height / 2),
+                             trkColor, 6, 8, 2);
         }
-        if (drawRoi) cv::rectangle(display, S(roiRect), cv::Scalar(40, 40, 255), 4);
+        if (drawRoi) {
+            const cv::Rect dr = S(roiRect);
+            const bool small = (dr.width < 40 || dr.height < 40);
+            cv::rectangle(display, dr, cv::Scalar(40, 40, 255), small ? 2 : 4);
+            if (ptrGate != ptr::Gate::Off && !small)  // [PTR] imlecte nisan isareti (ortasi bos)
+                drawGapCross(display, cv::Point(dr.x + dr.width / 2, dr.y + dr.height / 2),
+                             cv::Scalar(40, 40, 255), 5, 7, 2);
+        }
 
 
         // ===== FRAME mesajini Python beyne gonder =====
@@ -2322,10 +2915,19 @@ int main(int argc, char** argv)
             if (nowMs - lastLogMs >= 1000) {
                 lastLogMs = nowMs;
                 std::ostringstream ls;
+                const int lp = g_lastLossPermille.load();
                 ls << std::fixed << std::setprecision(1)
                    << "[LINK] rssi=" << rssiPct << "% kbps=" << g_curKbps
-                   << " drops=" << g_dropCount.load()
-                   << " loss=" << g_lastLossPermille.load() / 10.0f << "%\n";
+                   << " drops=" << g_dropCount.load() << " loss=";
+                if (lp < 0) ls << "RR-yok";   // [15 EKIM] alici hic Receiver Report yollamadi (0 ile karismasin)
+                else {
+                    // rtt/jit: son RR'dan; rr: o RR'in yasi (s). Ucusta rr buyuyorsa yer->hava
+                    // yonu (RR'lari tasiyan) aksiyor, loss/rtt bayat demektir.
+                    const int64_t rrAgeS = (nowMs - g_lastRrMs.load()) / 1000;
+                    ls << lp / 10.0f << "% rtt=" << g_lastRttX10.load() / 10.0f
+                       << "ms jit=" << g_lastJitX10.load() / 10.0f << "ms rr=" << rrAgeS << "s";
+                }
+                ls << "\n";
                 std::cout << ls.str();
             }
         }
@@ -2372,6 +2974,8 @@ int main(int argc, char** argv)
                 else
 #endif
                     ts << " miss=" << lostStreak;
+                if (g_ptrCfg.enabled && manualPath)                                       // [PTR]
+                    ts << " ptr=" << ptr::gateName(ptrGate) << (ptrDemoNow ? "(demo)" : "");
                 ts << "\n";
                 g_hybDetCalls = 0; g_hybDetRaw = 0;
                 std::cout << ts.str();
@@ -2405,6 +3009,15 @@ int main(int argc, char** argv)
             cv::putText(display, bt, cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.6,
                         g_badgeActive ? cv::Scalar(0, 255, 255) : cv::Scalar(200, 200, 200),
                         2, cv::LINE_AA);
+        }
+
+        // ===== [KH] BUYUTEC — OSD ve rozetten SONRA (ustu kapanmasin) =====
+        // Kaynak: takip kutusu > aday kutusu > ROI kutusu; hepsi proc koordinatinda.
+        // proc cizimsizdir (display ayri buffer), bu yuzden kirpma temiz gelir.
+        if (g_inset) {
+            if (drawTrk)       drawInset(display, proc, trkBoxP,  trkColor);
+            else if (drawCand) drawInset(display, proc, candBoxP, cv::Scalar(0, 255, 255));
+            else if (drawRoi)  drawInset(display, proc, roiRect,  cv::Scalar(40, 40, 255));
         }
 
         rtspPushFrame(display);

@@ -7,13 +7,24 @@ FrameClient, FlightLogger, StateMachine TEK KOPYA kalır.
 
 KANAL HARİTASI (yeni sistem)
   CH1-4  Roll/Pitch/Throttle/Yaw   — pilot (GUIDED_NOGPS'te FC yok sayar)
+                                     FC GUIDED iken sağ çubuk (CH1/CH2) runtracker
+                                     imlecini sürer (8 Ekim, [PTR])
   CH5    Uçuş modları              — FLTMODE_CH=5, FC yönetir. ORIN OKUMAZ.
   CH6    Otonom kapısı             — LOW=kapalı · MID=güvenlik · HIGH=otonom
   CH8    Pencere aç/kapa           — runtracker.cpp (latching)
-  CH9    Kilitle/bırak             — runtracker.cpp (latching)
+  CH9    boşta
   CH11   Arm/disarm                — RC11_OPTION=153, FC (latching ŞART)
-  CH12   boşta
+  CH12   Kilitle/bırak             — runtracker.cpp (yaylı slider)
   CH13   ROI boyut                 — runtracker.cpp (yaylı slider)
+
+FOLLOW DEVRİ (8 Ekim) — follow_gps takipçiyi GUIDED'da uçururken
+  VARSAYILAN: FC GUIDED'dayken otonoma GİRİLMEZ. Kilit sadece takip + log.
+              (dry-run hiçbir şey göndermediği için kilitlenmez: gölge log.)
+  --follow-handover: GUIDED'dan devre izin verir. Tetik yine CH6 HIGH (balon
+              avıyla aynı üçlü kapı). GUIDED_NOGPS'e geçilince follow_gps modu
+              görür ve komut göndermeyi bırakır (follow_gps 8 Ekim sürümü
+              çıkarken LOITER'a ZORLAMAZ; eskisi saldırıyı ezerdi).
+  Kumandadan moda aldıktan sonra (LOITER vb.) CH6 eskisi gibi çalışır.
 
 ÇIKIŞ MODU
   --exit-mode stabilize   kapalı alan testi (GPS gerekmez)
@@ -79,9 +90,41 @@ MODE_NUM = {
     'stabilize': 0,
     'acro': 1,
     'althold': 2,
+    'guided': 4,          # follow_gps (8 Ekim): devir kilidi + durum satırında ad
     'loiter': 5,
     'guided_nogps': 20,
 }
+
+
+# ---------------------------------------------------------------------------
+# FOLLOW DEVRİ (8 Ekim) — giriş kenarı kararı TEK YERDE, offline testli
+# (test_follow_handover_offline.py). main() bunu çağırır.
+# ---------------------------------------------------------------------------
+def follow_handover_blocked(dry_run, allow_handover, fc_mode):
+    """FC GUIDED'dayken (follow_gps uçuruyor) CANLI otonoma girilmesin mi?
+
+    True -> GİRME (sadece takip + log). Kural tek: FC modu GUIDED (4) ve
+    --follow-handover verilmemiş. Dry-run komut göndermediği için kilitlenmez
+    (gölge log çalışsın). Mod bilinmiyorsa (None) eski davranış.
+    """
+    return (not dry_run) and (not allow_handover) and fc_mode == MODE_NUM['guided']
+
+
+def entry_decision(want_auto, engaged, pending, pilot_escape,
+                   dry_run, allow_handover, fc_mode):
+    """Giriş kenarında ne yapılacak?
+
+    None       : giriş koşulu yok (eski koşul birebir)
+    'blocked'  : follow kilidi — FC GUIDED, devir kapalı
+    'simulate' : dry-run, otonom SİMÜLE edilir (komut yok)
+    'engage'   : canlı, otonom mod komutlanır
+    """
+    if not (want_auto and not engaged and not pending and not pilot_escape):
+        return None
+    if follow_handover_blocked(dry_run, allow_handover, fc_mode):
+        return 'blocked'
+    return 'simulate' if dry_run else 'engage'
+
 
 # Yedek mod: pozisyon kestirimi İSTEMEZ, her koşulda kabul edilir.
 # STABILIZE kendi kendine dengeler → acil durumda ACRO'dan güvenli.
@@ -421,6 +464,11 @@ def main():
                         "biliyorsan kullan.")
     p.add_argument('--enable-override', action='store_true',
                    help="GERÇEKTEN komut gönder + FC param yaz (PERVANESİZ bench!)")
+    p.add_argument('--follow-handover', action='store_true',
+                   help="follow_gps uçarken (FC GUIDED) CH6 ile GUIDED_NOGPS saldırısına "
+                        "DEVRE izin ver. Verilmezse FC GUIDED'dayken otonoma GİRİLMEZ "
+                        "(sadece takip + log). Kumandadan moda aldıktan sonra CH6 "
+                        "eskisi gibi çalışır.")
     p.add_argument('--log', default=None)
     args = p.parse_args()
 
@@ -456,7 +504,12 @@ def main():
     print("=" * 70)
     print(" HUNTER — GUIDED_NOGPS KONTROLCÜSÜ")
     print("=" * 70)
-    print(" CH5=uçuş modu(FC) · CH6=otonom · CH8=pencere · CH9=kilit · CH11=arm")
+    print(" CH5=uçuş modu(FC) · CH6=otonom · CH8=pencere · CH12=kilit · CH13=boyut · CH11=arm")
+    if args.follow_handover:
+        print(" FOLLOW: GUIDED'dan devir AÇIK (--follow-handover) — follow_gps uçarken "
+              "kilit + CH6 HIGH = GUIDED_NOGPS saldırısı")
+    else:
+        print(" FOLLOW: GUIDED'dan devir KAPALI — follow_gps uçarken sadece takip + log")
     print(f" Çıkış modu: {args.exit_mode.upper()}"
           f"   (yedek: {FALLBACK_PRIMARY} → {FALLBACK_SECOND})")
     if args.exit_mode == 'loiter':
@@ -690,6 +743,7 @@ def main():
     pending = False          # GUIDED_NOGPS komutu atıldı, teyit bekleniyor
     pilot_escape = False     # pilot CH5 ile kaçtı → CH6 kapanıp açılana dek girme
     t_pending = 0.0
+    follow_warned = False    # follow kilidi mesajı CH6 başına bir kez
 
     try:
         while True:
@@ -709,30 +763,48 @@ def main():
             if not ch6_high:
                 pilot_escape = False     # kaçış kilidi CH6 kapanınca açılır
                 floor.reset()            # taban kilidi de CH6 kapat-ac ile acilir
+                follow_warned = False    # follow kilidi mesajı yeniden basılabilir
             # ÜÇLÜ KAPI (controller_orin ile AYNI)
             want_auto = (state.mode == 'autonomous') and ch6_high and bbox['valid']
 
             # ---------- GİRİŞ KENARI ----------
             # pilot_escape kilidi: pilot CH5 ile kaçtıysa CH6 hâlâ HIGH diye
             # GUIDED_NOGPS'i geri komutlama — pilotla mod savaşı olur.
-            if want_auto and not engaged and not pending and not pilot_escape:
-                if dry_run:
-                    # DRY-RUN: mod komutu gonderilmiyor, dolayisiyla FC asla
-                    # GUIDED_NOGPS'e gecmez ve teyit gelmez. Teyidi sart kossak
-                    # kapali alan testinde kapilari/aksiyonlari hic goremezdik.
-                    # Burada SIMULE ediyoruz — komut yine GONDERILMIYOR.
-                    print("[GUIDED] (dry-run) otonom SIMULE ediliyor "
-                          "— FC modu degismez, komut gonderilmez")
-                    engaged = True
+            # FOLLOW kilidi (8 Ekim): FC GUIDED'da (follow_gps uçuruyor) ve
+            # --follow-handover yoksa canlı GİRİLMEZ. Karar entry_decision()'da.
+            decision = entry_decision(want_auto, engaged, pending, pilot_escape,
+                                      dry_run, args.follow_handover, fc.current_mode)
+            if decision == 'blocked':
+                # Kilit CH6 kapat-aç'a kadar SÜRER (pilot_escape ile aynı mekanizma).
+                # Yoksa pilot kumandadan LOITER'a alır almaz, CH6 hâlâ HIGH ve
+                # takip sürdüğü için saldırı KENDİLİĞİNDEN başlardı.
+                pilot_escape = True
+                if not follow_warned:
+                    print(f"[FOLLOW] {time.strftime('%H:%M:%S')} FC GUIDED'da (follow_gps "
+                          "uçuruyor) — devir KAPALI, otonoma GİRİLMİYOR. Kilit sadece "
+                          "takip + log. CH6'yı kapatıp açmadan hiçbir modda girilmez. "
+                          "Devir için --follow-handover.")
+                    follow_warned = True
+            elif decision == 'simulate':
+                # DRY-RUN: mod komutu gonderilmiyor, dolayisiyla FC asla
+                # GUIDED_NOGPS'e gecmez ve teyit gelmez. Teyidi sart kossak
+                # kapali alan testinde kapilari/aksiyonlari hic goremezdik.
+                # Burada SIMULE ediyoruz — komut yine GONDERILMIYOR.
+                print("[GUIDED] (dry-run) otonom SIMULE ediliyor "
+                      "— FC modu degismez, komut gonderilmez")
+                engaged = True
+            elif decision == 'engage':
+                if fc.current_mode == MODE_NUM['guided']:
+                    print("[FOLLOW] GUIDED'dan devir (--follow-handover): follow_gps "
+                          "modu görünce komutu bırakır")
+                if acro_path:
+                    print("[ACRO] Otonom istendi → ACRO komutlanıyor")
+                    sender.set_mode_fast(MODE_ACRO, n=5)
                 else:
-                    if acro_path:
-                        print("[ACRO] Otonom istendi → ACRO komutlanıyor")
-                        sender.set_mode_fast(MODE_ACRO, n=5)
-                    else:
-                        print("[GUIDED] Otonom istendi → GUIDED_NOGPS komutlanıyor")
-                        sender.set_mode_fast(MODE_GUIDED_NOGPS, n=5)
-                    pending = True
-                    t_pending = now
+                    print("[GUIDED] Otonom istendi → GUIDED_NOGPS komutlanıyor")
+                    sender.set_mode_fast(MODE_GUIDED_NOGPS, n=5)
+                pending = True
+                t_pending = now
 
             if pending:
                 _mname = 'ACRO' if acro_path else 'GUIDED_NOGPS'
@@ -855,8 +927,10 @@ def main():
                 a = last_action
                 r, pt, y = sender.last_rates
                 mode_s = fc.mode_name() if fc.current_mode is not None else "?"
+                _fl = (" [FOLLOW KİLİDİ]" if follow_handover_blocked(
+                           dry_run, args.follow_handover, fc.current_mode) else "")
                 print(f"[{time.strftime('%H:%M:%S')}] {state.mode:10s} FC={mode_s:12s} "
-                      f"CH6={channels.get('ch6',0)} bbox={'OK' if bbox['valid'] else '--'}")
+                      f"CH6={channels.get('ch6',0)} bbox={'OK' if bbox['valid'] else '--'}{_fl}")
                 if engaged:
                     if args.action_units == 'attitude_deg':
                         ar, ap, ay = sender.last_attitude

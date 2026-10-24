@@ -8,9 +8,18 @@
 // MODEL (models/UAV-YOLOv11m-768.onnx metadata'sindan DOGRULANDI):
 //   giris  : images  (1, 3, 768, 768)   fp32, RGB, /255, letterbox 114
 //   cikis  : output0 (1, 8, 12096)      8 = 4 kutu + 4 SINIF
+//   [YO] SAHI motoru UAV-YOLOv11m-640x768: giris (1,3,640,768), cikis (1,8,10080)
+//        10080 = 80*96 + 40*48 + 20*24. Letterbox ayni formulle (letterboxRect).
 //   siniflar: {0: airplane, 1: bird, 2: drone, 3: helicopter}
 //   end2end=False -> NMS graf ICINDE DEGIL, burada yapilir.
 //   12096 = 96^2 + 48^2 + 24^2  (stride 8/16/32 @ 768)
+//
+// [SK] 21 Ekim: SABIT KANAT modeli yolo11s-plane (yolo11s-sabitkanat-ortrack
+//   paketi, upstream berkeduruu/yolo-aircraft-detection S_new720p.pt).
+//   TEK SINIF {0: plane}; 640x768 motorda cikis (1, 5, 10080).
+//   Sinif sayisi artik MOTORDAN okunur; hedef sinif yoloAutoTargetClass()
+//   ile secilir ya da --yolo-class N ile verilir. 4 sinifli UAV modelinde
+//   varsayilan hedef yine 2 (drone) -> eski davranis birebir ayni.
 //
 // ULTRALYTICS UYUMU — bilerek birebir:
 //   * conf = TUM siniflar uzerinde MAX, cls = ARGMAX. Sinif filtresi
@@ -31,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <string>
 #include <vector>
 
 namespace hybrid {
@@ -50,50 +60,102 @@ inline const char* yoloClassName(int c) {
     }
 }
 
+// [SK] Hedef sinif secimi. requested >= 0: kullanici verdi (--yolo-class).
+// requested < 0: OTOMATIK — 4 sinifli UAV modeli -> 2 (drone, eski davranis),
+// tek sinifli model (yolo11s-plane) -> 0. Baska sinif sayisinda tahmin
+// YAPILMAZ: -1 doner, cagiran acikca --yolo-class istemelidir.
+// Gecersiz (requested >= nc ya da nc < 1) -> -1.
+inline int yoloResolveTargetClass(int nc, int requested)
+{
+    if (nc < 1) return -1;
+    if (requested >= 0) return requested < nc ? requested : -1;
+    if (nc == kYoloNumClasses) return YOLO_DRONE;
+    if (nc == 1) return 0;
+    return -1;
+}
+
+// Log/konsol icin sinif etiketi: 4 sinifli UAV modelinde isim, digerlerinde "#N"
+// (motor isim bilgisi tasimaz; tek sinifli yolo11s-plane'de #0 = plane).
+inline std::string yoloClassLabel(int nc, int c)
+{
+    if (nc == kYoloNumClasses) return yoloClassName(c);
+    return "#" + std::to_string(c);
+}
+
 // ---------------------------------------------------------------------
 struct LetterboxInfo {
     double r    = 1.0;   // olcek
     int    left = 0, top = 0;
-    int    size = 0;     // kare giris kenari
+    int    size = 0;     // giris GENISLIGI (kare motorda kenar; eski alan adi korundu)
+    int    inW = 0, inH = 0;   // [YO] giris boyutu (dikdortgen motor: 768 x 640)
     int    origW = 0, origH = 0;
     bool   ok   = false;
 };
 
-// ultralytics LetterBox(new_shape=(size,size), auto=False, scaleFill=False,
-//                       scaleup=True, center=True), deger 114.
-inline LetterboxInfo letterbox(const cv::Mat& bgr, int size, cv::Mat& out)
+// [YO] Letterbox GEOMETRISI (goruntusuz). Kare ve dikdortgen motor ayni formul:
+//   r = min(inH/H, inW/W) ; nw,nh = round(W*r), round(H*r) ; pad = round(d -/+ 0.1)
+// Bu, ultralytics LetterBox(auto=False, scaleup=True, center=True) ve
+// YoloORTrack adapters/yolo_gpu.py ile ayni. Kare motorda (inH == inW == size)
+// islem sirasi eski letterbox() ile BIREBIR ayni -> test_yolo_offline degismez.
+struct LetterboxGeom {
+    double r = 1.0;
+    int nw = 0, nh = 0, top = 0, bottom = 0, left = 0, right = 0;
+    bool ok = false;
+};
+inline LetterboxGeom letterboxGeom(int W, int H, int inH, int inW)
 {
-    LetterboxInfo li;
-    if (bgr.empty() || bgr.type() != CV_8UC3 || size <= 0) return li;
-
-    const int W = bgr.cols, H = bgr.rows;
-    const double r = std::min((double)size / (double)H, (double)size / (double)W);
+    LetterboxGeom g;
+    if (W <= 0 || H <= 0 || inH <= 0 || inW <= 0) return g;
+    const double r = std::min((double)inH / (double)H, (double)inW / (double)W);
     // py: new_unpad = (round(w*r), round(h*r))   -> Python round = ties-to-even
     const int nw = (int)std::nearbyint((double)W * r);
     const int nh = (int)std::nearbyint((double)H * r);
-    if (nw <= 0 || nh <= 0 || nw > size || nh > size) return li;
+    if (nw <= 0 || nh <= 0 || nw > inW || nh > inH) return g;
 
-    const double dw = (double)(size - nw) / 2.0;
-    const double dh = (double)(size - nh) / 2.0;
-    const int top    = (int)std::nearbyint(dh - 0.1);
-    const int bottom = (int)std::nearbyint(dh + 0.1);
-    const int left   = (int)std::nearbyint(dw - 0.1);
-    const int right  = (int)std::nearbyint(dw + 0.1);
+    const double dw = (double)(inW - nw) / 2.0;
+    const double dh = (double)(inH - nh) / 2.0;
+    g.top    = (int)std::nearbyint(dh - 0.1);
+    g.bottom = (int)std::nearbyint(dh + 0.1);
+    g.left   = (int)std::nearbyint(dw - 0.1);
+    g.right  = (int)std::nearbyint(dw + 0.1);
+    g.r = r; g.nw = nw; g.nh = nh; g.ok = true;
+    return g;
+}
+
+// ultralytics LetterBox(new_shape=(inH,inW), auto=False, scaleFill=False,
+//                       scaleup=True, center=True), deger 114.
+// bgr bir ROI (SAHI karosu) olabilir: resize sadece ROI'yi okur, kenarlama
+// BORDER_ISOLATED ile ana goruntuye tasmaz.
+inline LetterboxInfo letterboxRect(const cv::Mat& bgr, int inH, int inW, cv::Mat& out)
+{
+    LetterboxInfo li;
+    if (bgr.empty() || bgr.type() != CV_8UC3 || inH <= 0 || inW <= 0) return li;
+
+    const int W = bgr.cols, H = bgr.rows;
+    const LetterboxGeom g = letterboxGeom(W, H, inH, inW);
+    if (!g.ok) return li;
 
     cv::Mat resized;
-    if (nw != W || nh != H) cv::resize(bgr, resized, cv::Size(nw, nh));  // INTER_LINEAR
-    else                    resized = bgr;
+    if (g.nw != W || g.nh != H) cv::resize(bgr, resized, cv::Size(g.nw, g.nh));  // INTER_LINEAR
+    else                        resized = bgr;
 
-    // BORDER_ISOLATED: resized bir ROI degil ama alisknalik olarak acik
-    // birakiliyor; ortrack_core.hpp'deki hata burada da olusamasin.
-    cv::copyMakeBorder(resized, out, top, bottom, left, right,
+    // BORDER_ISOLATED: resized bir ROI olabilir (karo, olcek 1.0) -> dolgu
+    // ana goruntunun piksellerinden DEGIL sabit 114'ten gelmeli.
+    cv::copyMakeBorder(resized, out, g.top, g.bottom, g.left, g.right,
                        cv::BORDER_CONSTANT | cv::BORDER_ISOLATED,
                        cv::Scalar(kLetterboxPad, kLetterboxPad, kLetterboxPad));
-    if (out.cols != size || out.rows != size) return li;
+    if (out.cols != inW || out.rows != inH) return li;
 
-    li.r = r; li.left = left; li.top = top; li.size = size;
+    li.r = g.r; li.left = g.left; li.top = g.top; li.size = inW;
+    li.inW = inW; li.inH = inH;
     li.origW = W; li.origH = H; li.ok = true;
     return li;
+}
+
+// Kare motor (eski arayuz): letterboxRect(size, size) ile birebir ayni sonuc.
+inline LetterboxInfo letterbox(const cv::Mat& bgr, int size, cv::Mat& out)
+{
+    return letterboxRect(bgr, size, size, out);
 }
 
 // BGR uint8 HWC -> RGB float32 CHW, /255 (ultralytics: mean/std YOK).

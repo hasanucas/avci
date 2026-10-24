@@ -25,6 +25,11 @@ struct TrtOptions {
                                    // olcegi kaybediyor, sonra arka plana atliyor.
     bool  verbose     = false;     // TRT info loglari
     int   warmupIters = 3;         // ilk karede tokezlemeyi onler
+    // [YO] YoloORTrack async_pipeline: tracker CUDA stream'i EN YUKSEK oncelikte
+    // (torch.cuda.Stream(priority=-1)). Arka planda YOLO taramasi GPU'yu
+    // doldururken tracker cekirdekleri one gecer. Varsayilan KAPALI: eski
+    // modlar (--ortrack/--hybrid) birebir ayni kalir; sadece --yolo-ortrack acar.
+    bool  highPriorityStream = false;
 };
 
 // ORTrack IKI arayuzu birden uygular:

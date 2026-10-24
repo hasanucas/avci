@@ -90,9 +90,13 @@ public:
     bool open(std::string& err);
 
     bool detect(const cv::Mat& bgr, std::vector<Detection>& out) override;
-    int    inputSize() const override { return size_; }
+    int    inputSize() const override { return inW_; }
+    int    inputH()    const override { return inH_; }
+    int    inputW()    const override { return inW_; }
     double lastMs()    const override { return msTotal_; }
     double inferMs()   const override { return msInfer_; }
+    int    numClasses()  const override { return nc_; }
+    int    targetClass() const override { return target_; }
 
 private:
     YoloOptions opt_;
@@ -103,7 +107,9 @@ private:
     cudaStream_t stream_ = nullptr;
 
     std::string inName_, outName_;
-    int   size_ = 0, nc_ = 0, anchors_ = 0;
+    int   inH_ = 0, inW_ = 0, nc_ = 0, anchors_ = 0;   // [YO] dikdortgen motor (640x768) destegi
+    int   target_ = -1;                                 // [SK] tutulan sinif
+    std::unique_ptr<bool[]> keep_;                      // [SK] nc_ uzunlukta; sadece target_ true
     size_t inElems_ = 0, outElems_ = 0;
     float *dIn_ = nullptr, *dOut_ = nullptr, *hIn_ = nullptr, *hOut_ = nullptr;
 
@@ -159,30 +165,47 @@ bool YoloTrt::open(std::string& err)
     }
     const nvinfer1::Dims di = engine_->getTensorShape(inName_.c_str());
     const nvinfer1::Dims dou = engine_->getTensorShape(outName_.c_str());
-    if (di.nbDims != 4 || di.d[0] != 1 || di.d[1] != 3 || di.d[2] != di.d[3]) {
-        err = "YOLO girisi (1,3,S,S) bicimi degil (dinamik/batch motor desteklenmiyor)."; return false;
+    // [YO] Kare (1,3,S,S) VEYA dikdortgen (1,3,H,W) sabit giris. Dinamik/batch yok.
+    if (di.nbDims != 4 || di.d[0] != 1 || di.d[1] != 3 || di.d[2] <= 0 || di.d[3] <= 0) {
+        err = "YOLO girisi (1,3,H,W) sabit bicimde degil (dinamik/batch motor desteklenmiyor)."; return false;
     }
     if (dou.nbDims != 3 || dou.d[0] != 1) {
         err = "YOLO ciktisi (1, 4+nc, N) bicimi degil."; return false;
     }
-    size_    = (int)di.d[2];
+    inH_     = (int)di.d[2];
+    inW_     = (int)di.d[3];
     nc_      = (int)dou.d[1] - 4;
     anchors_ = (int)dou.d[2];
-    if (nc_ != kYoloNumClasses) {
-        err = "YOLO motoru " + std::to_string(nc_) + " sinif bildiriyor, " +
-              std::to_string(kYoloNumClasses) + " bekleniyordu "
-              "(airplane, bird, drone, helicopter). Yanlis model dosyasi.";
+    // [SK] Sinif sayisi MOTORDAN. Eskiden 4 disi reddediliyordu; artik tek
+    // sinifli yolo11s-plane de calisir. Hedef sinif cozulemezse ACIKCA dur.
+    if (nc_ < 1) {
+        err = "YOLO ciktisinda sinif yok (4+nc kanal, nc=" + std::to_string(nc_) + ").";
         return false;
     }
+    target_ = yoloResolveTargetClass(nc_, opt_.targetClass);
+    if (target_ < 0) {
+        if (opt_.targetClass >= 0)
+            err = "--yolo-class " + std::to_string(opt_.targetClass) + " gecersiz: motorda " +
+                  std::to_string(nc_) + " sinif var (0.." + std::to_string(nc_ - 1) + ").";
+        else
+            err = "YOLO motoru " + std::to_string(nc_) + " sinif bildiriyor; hedef sinif "
+                  "otomatik secilemez (4 sinif -> drone, 1 sinif -> 0)."
+                  "\n       --yolo-class N ile secin (0.." + std::to_string(nc_ - 1) + ").";
+        return false;
+    }
+    keep_.reset(new bool[nc_]());          // hepsi false
+    keep_[target_] = true;
     // Cikti izgara sayisi girdi boyutuyla tutarli mi (stride 8/16/32)?
-    const int g = size_ / 8, expect = g * g + (g / 2) * (g / 2) + (g / 4) * (g / 4);
+    // Kare 768: 96^2+48^2+24^2 = 12096 ; dikdortgen 640x768: 80*96+40*48+20*24 = 10080
+    const int expect = (inH_ / 8) * (inW_ / 8) + (inH_ / 16) * (inW_ / 16) + (inH_ / 32) * (inW_ / 32);
     if (anchors_ != expect) {
         err = "YOLO cikti izgarasi " + std::to_string(anchors_) + ", " +
-              std::to_string(expect) + " bekleniyordu (giris " + std::to_string(size_) + ").";
+              std::to_string(expect) + " bekleniyordu (giris " + std::to_string(inH_) + "x" +
+              std::to_string(inW_) + ").";
         return false;
     }
 
-    inElems_  = (size_t)3 * size_ * size_;
+    inElems_  = (size_t)3 * inH_ * inW_;
     outElems_ = (size_t)(4 + nc_) * anchors_;
 
     if (!cudaOk(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "streamCreate", err)) return false;
@@ -202,8 +225,9 @@ bool YoloTrt::open(std::string& err)
         if (!ctx_->enqueueV3(stream_)) { err = "YOLO isinma cagrisi basarisiz"; return false; }
     if (!cudaOk(cudaStreamSynchronize(stream_), "isinma sync", err)) return false;
 
-    std::cout << "[YOLO] giris " << size_ << "x" << size_
-              << "  sinif " << nc_ << "  izgara " << anchors_ << "\n";
+    std::cout << "[YOLO] giris " << inH_ << "x" << inW_ << " (HxW)"
+              << "  sinif " << nc_ << "  hedef " << target_ << " (" << yoloClassLabel(nc_, target_) << ")"
+              << "  izgara " << anchors_ << "\n";
     return true;
 }
 
@@ -212,7 +236,7 @@ bool YoloTrt::detect(const cv::Mat& bgr, std::vector<Detection>& out)
     const auto tAll = Clock::now();
     out.clear();
 
-    const LetterboxInfo li = letterbox(bgr, size_, lb_);
+    const LetterboxInfo li = letterboxRect(bgr, inH_, inW_, lb_);
     if (!li.ok) { msTotal_ = msSince(tAll); return false; }
     lut_.apply(lb_, hIn_);
 
@@ -226,7 +250,7 @@ bool YoloTrt::detect(const cv::Mat& bgr, std::vector<Detection>& out)
     msInfer_ = msSince(tInf);
 
     yoloPostprocess(hOut_, nc_, anchors_, opt_.confidence, opt_.nmsIoU,
-                    opt_.maxDet, opt_.keepClass, li, out);
+                    opt_.maxDet, keep_.get(), li, out);
     msTotal_ = msSince(tAll);
     return true;
 }

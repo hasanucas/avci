@@ -1,4 +1,4 @@
-# AVCI referans ortam — 2026-09-23 11:37:51 — ubuntu — avci2
+# AVCI referans ortam — 2026-10-24 10:56:36 — ubuntu — avci2
 # Anahtar satirlar (kurulum_orin.sh / kontrol.sh okur):
 L4T=R36.4.7
 JETPACK=6.2.1+b38
@@ -20,10 +20,10 @@ cuda    : Build cuda_12.6.r12.6/compiler.34714021_0
 ram     : 7607 MB
 swap    :
   NAME       TYPE      SIZE USED PRIO
-  /dev/zram0 partition 634M   0B    5
-  /dev/zram1 partition 634M   0B    5
-  /dev/zram2 partition 634M   0B    5
-  /dev/zram3 partition 634M   0B    5
+  /dev/zram0 partition 634M 256K    5
+  /dev/zram1 partition 634M 256K    5
+  /dev/zram2 partition 634M 256K    5
+  /dev/zram3 partition 634M 256K    5
   /dev/zram4 partition 634M   0B    5
   /dev/zram5 partition 634M   0B    5
 ## GStreamer eklentileri

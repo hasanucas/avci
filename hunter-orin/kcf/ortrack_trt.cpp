@@ -102,6 +102,14 @@ public:
         score_ = rawScore_ = -1.0f;
         msTotal_ = msInfer_ = 0.0;
     }
+    // [YO] ORTrackBase.relocate: sablona DOKUNMADAN bir sonraki arama kirpmasini
+    // bu kutuya ortala (center_blend duzeltmesi ve kutu sinirlamasi kullanir).
+    bool canRelocate() const override { return true; }
+    bool relocate(const BoxF& box) override {
+        if (!haveBox_ || !box.ok()) return false;   // py: sablon yoksa RuntimeError
+        box_ = box;
+        return true;
+    }
     float  score()    const override { return score_; }
     float  rawScore() const override { return rawScore_; }
     double lastMs()   const override { return msTotal_; }
@@ -219,7 +227,16 @@ bool OrtrackTrtBackend::open(std::string& err)
     }
 
     // ---- tamponlar
-    if (!cudaOk(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "streamCreate", err)) return false;
+    if (opt_.highPriorityStream) {
+        // [YO] En yuksek oncelik = sayisal olarak EN KUCUK deger (greatest priority).
+        int least = 0, greatest = 0;
+        if (!cudaOk(cudaDeviceGetStreamPriorityRange(&least, &greatest), "streamPriorityRange", err)) return false;
+        if (!cudaOk(cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking, greatest),
+                    "streamCreateWithPriority", err)) return false;
+        std::cout << "[ORT] CUDA stream onceligi: " << greatest << " (aralik " << least << ".." << greatest << ")\n";
+    } else {
+        if (!cudaOk(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "streamCreate", err)) return false;
+    }
 
     auto devAlloc = [&](float** p, size_t elems) {
         if (!cudaOk(cudaMalloc((void**)p, elems * sizeof(float)), "cudaMalloc", err)) return false;
