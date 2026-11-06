@@ -1,4 +1,9 @@
-"""External gate GPS feed (UDP JSON) + geo helpers for GUIDED approach."""
+"""External gate GPS feed (MAVLink GLOBAL_POSITION_INT) + geo helpers.
+
+The companion listens on its own link (USB telemetry serial, or UDP in sim).
+That stream is not the drone's MAVLink connection. ``GateGpsSample.alt`` is
+metres above our drone's home: target AMSL minus our home AMSL.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import math
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -24,8 +29,13 @@ _METERS_PER_DEG_LAT = 111320.0
 class GateGpsSample:
     lat: float
     lon: float
+    # Metres above our home once that home is known. Before then this is the
+    # target's own relative_alt and must not be commanded.
     alt: float
     recv_mono: float
+    # Target GLOBAL_POSITION_INT.alt (AMSL, metres). None for samples that are
+    # already in our frame (coast / JSON).
+    alt_amsl_m: float | None = None
 
 
 def enu_to_latlon(
@@ -123,6 +133,57 @@ def speed_band_for_range_m(
     if d >= float(near_m):
         return float(speed_near_mps), f"{near_m:.0f}-{mid_m:.0f}m"
     return float(speed_near_mps), f"<{near_m:.0f}m"
+
+
+def sample_from_global_position_int(
+    *,
+    lat_e7: int,
+    lon_e7: int,
+    relative_alt_mm: int,
+    recv_mono: float,
+    alt_mm: int | None = None,
+) -> GateGpsSample:
+    """MAVLink GLOBAL_POSITION_INT → gate sample.
+
+    ``lat``/``lon`` are degE7. ``alt`` is AMSL millimetres. ``relative_alt``
+    is the target's own home. ``GateGpsSample.alt`` stays on that relative
+    value until ``GateMavlinkReceiver.set_our_home_amsl_m`` subtracts our home.
+    """
+    amsl = None if alt_mm is None else float(alt_mm) / 1000.0
+    return GateGpsSample(
+        lat=float(lat_e7) * 1e-7,
+        lon=float(lon_e7) * 1e-7,
+        alt=float(relative_alt_mm) / 1000.0,
+        recv_mono=float(recv_mono),
+        alt_amsl_m=amsl,
+    )
+
+
+def alt_above_our_home(sample: GateGpsSample, our_home_amsl_m: float | None) -> float:
+    """Target height above our home. Falls back to ``sample.alt`` without AMSL."""
+    if our_home_amsl_m is None or sample.alt_amsl_m is None:
+        return float(sample.alt)
+    return float(sample.alt_amsl_m) - float(our_home_amsl_m)
+
+
+def adopt_our_home_amsl(receiver: GateMavlinkReceiver, home_amsl_m: float | None) -> None:
+    """Push the drone's home AMSL into the gate receiver when it is known."""
+    if home_amsl_m is None:
+        return
+    receiver.set_our_home_amsl_m(float(home_amsl_m))
+
+
+def mavlink_link_needs_baud(connection: str) -> bool:
+    """True for a serial device path. UDP/TCP connection strings ignore baud."""
+    text = str(connection).strip()
+    lower = text.lower()
+    if lower.startswith(("udp", "tcp")):
+        return False
+    if lower.startswith("serial:"):
+        # serial:/dev/ttyUSB0:57600 already carries the rate.
+        rest = text.split(":", 1)[1]
+        return rest.count(":") == 0
+    return text.startswith("/") or text.upper().startswith("COM")
 
 
 def parse_gate_gps_payload(raw: bytes | str) -> tuple[float, float, float]:
@@ -251,6 +312,174 @@ class GateGpsReceiver:
             time.sleep(0.05)
         raise TimeoutError(
             f"no gate GPS on udp://{self.bind_host}:{self.port} within {timeout_s:.0f}s"
+        )
+
+    @property
+    def packet_count(self) -> int:
+        with self._lock:
+            return self._packets
+
+
+class GateMavlinkReceiver:
+    """Background MAVLink listener; keeps the latest target GLOBAL_POSITION_INT.
+
+    ``connection`` is a pymavlink string: ``udpin:0.0.0.0:14560`` in sim, or
+    ``/dev/ttyUSB0`` for a USB telemetry radio (``baud`` applies). ``sysid``
+    selects the target vehicle; ``0`` accepts any system id.
+    """
+
+    def __init__(
+        self,
+        *,
+        connection: str = "udpin:0.0.0.0:14560",
+        baud: int = 57600,
+        sysid: int = 99,
+        stale_timeout_s: float = 3.0,
+    ) -> None:
+        self.connection = str(connection)
+        self.baud = int(baud)
+        self.sysid = int(sysid)
+        self.stale_timeout_s = float(stale_timeout_s)
+        self._lock = threading.Lock()
+        self._latest: GateGpsSample | None = None
+        self._conn: Any = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._packets = 0
+        self._ignored = 0
+        self._our_home_amsl_m: float | None = None
+        self._announced_home = False
+
+    def set_our_home_amsl_m(self, home_amsl_m: float) -> None:
+        """Our drone's home AMSL. Later ``latest()`` alts are above this home."""
+        home = float(home_amsl_m)
+        if not math.isfinite(home):
+            return
+        with self._lock:
+            prev = self._our_home_amsl_m
+            self._our_home_amsl_m = home
+            announce = not self._announced_home
+            if announce:
+                self._announced_home = True
+        if announce or (prev is not None and abs(home - prev) >= 1.0):
+            print(
+                f"[GATE-GPS] our home AMSL={home:.1f}m — "
+                f"target alt = target AMSL − this home",
+                flush=True,
+            )
+
+    def link_label(self) -> str:
+        sys = "any" if self.sysid == 0 else str(self.sysid)
+        if mavlink_link_needs_baud(self.connection):
+            return f"{self.connection} @ {self.baud} baud, sysid={sys}"
+        return f"{self.connection} sysid={sys}"
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        from pymavlink import mavutil
+
+        kwargs: dict[str, Any] = {
+            "source_system": 255,
+            "source_component": 191,
+        }
+        if mavlink_link_needs_baud(self.connection):
+            kwargs["baud"] = self.baud
+        self._conn = mavutil.mavlink_connection(self.connection, **kwargs)
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop,
+            name="GateMavlinkReceiver",
+            daemon=True,
+        )
+        self._thread.start()
+        print(
+            f"[GATE-GPS] listening mavlink {self.link_label()} "
+            f"(stale>{self.stale_timeout_s:.1f}s)",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _loop(self) -> None:
+        conn = self._conn
+        assert conn is not None
+        while not self._stop.is_set():
+            try:
+                msg = conn.recv_match(
+                    type="GLOBAL_POSITION_INT",
+                    blocking=True,
+                    timeout=0.2,
+                )
+            except Exception:
+                if self._stop.is_set():
+                    break
+                continue
+            if msg is None:
+                continue
+            src = int(msg.get_srcSystem())
+            if self.sysid != 0 and src != self.sysid:
+                self._ignored += 1
+                continue
+            if int(msg.lat) == 0 and int(msg.lon) == 0:
+                continue
+            sample = sample_from_global_position_int(
+                lat_e7=int(msg.lat),
+                lon_e7=int(msg.lon),
+                alt_mm=int(msg.alt),
+                relative_alt_mm=int(msg.relative_alt),
+                recv_mono=time.monotonic(),
+            )
+            with self._lock:
+                self._latest = sample
+                self._packets += 1
+
+    def latest(self, *, require_fresh: bool = False) -> GateGpsSample | None:
+        with self._lock:
+            sample = self._latest
+            home = self._our_home_amsl_m
+        if sample is None:
+            return None
+        if require_fresh and self.is_stale(sample):
+            return None
+        if home is not None and sample.alt_amsl_m is not None:
+            sample = replace(sample, alt=alt_above_our_home(sample, home))
+        return sample
+
+    def is_stale(self, sample: GateGpsSample | None = None) -> bool:
+        with self._lock:
+            s = sample if sample is not None else self._latest
+        if s is None:
+            return True
+        if self.stale_timeout_s <= 0:
+            return False
+        return (time.monotonic() - s.recv_mono) > self.stale_timeout_s
+
+    def wait_first(self, *, timeout_s: float = 120.0) -> GateGpsSample:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() < deadline:
+            sample = self.latest()
+            if sample is not None:
+                print(
+                    f"[GATE-GPS] first fix lat={sample.lat:.7f} lon={sample.lon:.7f} "
+                    f"alt={sample.alt:.1f}m",
+                    flush=True,
+                )
+                return sample
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"no gate GPS on {self.link_label()} within {timeout_s:.0f}s"
         )
 
     @property

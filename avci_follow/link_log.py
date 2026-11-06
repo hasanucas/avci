@@ -53,7 +53,7 @@ _RELAY_HEADER = (
 # to the chaser's groundspeed first moving toward the new target (INCLUDES FC +
 # physical acceleration, not pure transport).
 _CMDLAT_HEADER = "t_wall_iso,t_mono,event,command,latency_ms,detail"
-_CMD_NAMES = {178: "DO_CHANGE_SPEED", 512: "REQUEST_MESSAGE"}
+_CMD_NAMES = {178: "DO_CHANGE_SPEED", 512: "REQUEST_MESSAGE", 111: "TIMESYNC"}
 
 
 class _CsvFile:
@@ -84,34 +84,47 @@ class _CsvFile:
             pass
 
 
+def _is_target_radio(radio) -> bool:
+    """Vehicle names are padded for aligned console output ("HEDEF  "), so
+    compare normalised. (Bug fix: an exact == "HEDEF" test sent every target
+    message into the chaser CSV and left hedef_link_*.csv empty.)"""
+    return str(radio).strip().upper().startswith("HEDEF")
+
+
 class LinkLogger:
     def __init__(self, log_dir="logs", *, meta: dict | None = None,
-                 enabled: bool = True, flush_every_s: float = 2.0):
+                 enabled: bool = True, flush_every_s: float = 2.0,
+                 with_relay: bool = True, with_cmd: bool = True):
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
         self._last_flush = time.monotonic()
         self._flush_every = float(flush_every_s)
-        # per (radio, msg_type) -> (last_t_mono, ema_hz)
+        # per (radio, msg_type) -> last t_mono
         self._last: dict[tuple[str, str], float] = {}
         self.target_csv = None
         self.chaser_csv = None
         self.relay_csv = None
         self.cmd_lat = CmdLatencyTracker(None, enabled=False)
+        self.stamp = time.strftime("%Y%m%d_%H%M%S")
+        self.log_dir = Path(log_dir)
         if not self.enabled:
             return
-        d = Path(log_dir)
+        d = self.log_dir
         d.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stamp = self.stamp
         meta = dict(meta or {})
         self.target_csv = _CsvFile(d / f"hedef_link_{stamp}.csv",
                                    {**meta, "radio": "HEDEF"}, _LINK_HEADER)
         self.chaser_csv = _CsvFile(d / f"chaser_link_{stamp}.csv",
                                    {**meta, "radio": "TAKIPCI"}, _LINK_HEADER)
-        self.relay_csv = _CsvFile(d / f"relay_lat_{stamp}.csv", meta, _RELAY_HEADER)
-        self.cmd_lat = CmdLatencyTracker(d / f"cmd_lat_{stamp}.csv", meta, enabled=True)
-        print(f"[LOG] link+latency logging -> {self.target_csv.path.parent}/"
-              f"(hedef|chaser)_link_{stamp}.csv, relay_lat_{stamp}.csv, "
-              f"cmd_lat_{stamp}.csv", flush=True)
+        names = [f"(hedef|chaser)_link_{stamp}.csv"]
+        if with_relay:
+            self.relay_csv = _CsvFile(d / f"relay_lat_{stamp}.csv", meta, _RELAY_HEADER)
+            names.append(f"relay_lat_{stamp}.csv")
+        if with_cmd:
+            self.cmd_lat = CmdLatencyTracker(d / f"cmd_lat_{stamp}.csv", meta, enabled=True)
+            names.append(f"cmd_lat_{stamp}.csv")
+        print(f"[LOG] link+latency logging -> {d}/" + ", ".join(names), flush=True)
 
     # ------------------------------------------------ per-message (RX threads)
     def note_message(self, radio: str, msg, t_mono: float | None = None) -> None:
@@ -126,10 +139,10 @@ class LinkLogger:
         # RADIO_STATUS is emitted by the SiK radio itself (legacy name "RADIO").
         is_radio = mtype in ("RADIO_STATUS", "RADIO")
         with self._lock:
-            csv = self.target_csv if radio == "HEDEF" else self.chaser_csv
+            csv = self.target_csv if _is_target_radio(radio) else self.chaser_csv
             if csv is None:
                 return
-            key = (radio, mtype)
+            key = (str(radio).strip(), mtype)
             prev = self._last.get(key)
             gap_ms = "" if prev is None else round((now - prev) * 1000.0, 1)
             inst_hz = "" if (prev is None or now <= prev) else round(1.0 / (now - prev), 2)
@@ -227,6 +240,7 @@ class CmdLatencyTracker:
         self.csv = None
         self.rtt_count = 0
         self.lost_count = 0
+        self._recent_ms = []                       # last few RTTs, for live display
         if self.enabled:
             self.csv = _CsvFile(path, dict(meta or {}), _CMDLAT_HEADER)
 
@@ -268,7 +282,35 @@ class CmdLatencyTracker:
             else:
                 self._row(t_mono, "rtt", cmd, dt * 1000.0, "")
                 self.rtt_count += 1
+                self._recent_ms = (self._recent_ms + [dt * 1000.0])[-20:]
             self._maybe_flush(t_mono)
+
+    def note_rtt(self, command: int, latency_ms: float, t_mono: float) -> None:
+        """Log an RTT measured by the caller (e.g. a TIMESYNC round trip on
+        relay_radio, timed from its own echoed stamp). Any thread."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._row(t_mono, "rtt", command, float(latency_ms), "")
+            self.rtt_count += 1
+            self._recent_ms = (self._recent_ms + [float(latency_ms)])[-20:]
+            self._maybe_flush(t_mono)
+
+    def note_lost(self, command: int, t_mono: float, detail: str = "") -> None:
+        """Log a probe that never got its reply. Any thread."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._row(t_mono, "rtt_lost", command, None, detail)
+            self.lost_count += 1
+            self._maybe_flush(t_mono)
+
+    def summary(self):
+        """(samples, lost, median of the last 20 RTTs in ms or None) — display only."""
+        with self._lock:
+            r = sorted(self._recent_ms)
+            med = r[len(r) // 2] if r else None
+            return self.rtt_count, self.lost_count, med
 
     def arm_speed(self, from_gs: float, target: float, t_mono: float) -> None:
         """Begin a speed-response measurement for a new speed target (main)."""

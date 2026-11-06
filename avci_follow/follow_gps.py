@@ -22,8 +22,13 @@ FOLLOW (trails on the course line). Speed is adaptive — up to --max-speed far
 out, tapering to --close-approach inside --deadline-range by design.
 
 The transport layer (two Vehicles, receive threads, snapshots, sysid check,
-recording trigger, LOITER-on-exit, safety gates) is lifted from the proven
-follow_relay.py; a small on_msg hook feeds link_log for telemetry diagnostics.
+recording trigger, safety gates) is lifted from the proven follow_relay.py; a
+small on_msg hook feeds link_log for telemetry diagnostics. The per-tick brain
+is chase_core.TrackController, shared with the Orin front-end (chase_orin.py).
+
+Gate failures (target stale / no fix / beyond --max-dist / --min-sep) HOLD the
+chaser at its current position (the sim's --stale-hold), instead of letting it
+keep flying toward the last carrot.
 
 ALWAYS dry-run first to read the true vertical separation, then set --sep-bias:
   python follow_gps.py --target-port COM12 --chaser-port COM5 --dry-run --no-rec
@@ -32,8 +37,9 @@ Typical filming run (defaults are filming-ready: clean altitude mode on, 3 m
 below, full 20 m/s until ~200 m, 10 m/s inside 100 m):
   python follow_gps.py --target-port COM12 --chaser-port COM5 --sep-bias <m> --set-mode
 
-Ctrl-C -> chaser LOITER. The RC mode switch overrides at any instant; if the
-chaser leaves GUIDED this script exits and hands control back to the pilot.
+Ctrl-C (or an unexpected error) -> chaser LOITER. The RC mode switch overrides
+at any instant; if the chaser leaves GUIDED this script exits and never touches
+the mode again (the pilot's choice stands).
 
 SAFETY (read once): two real drones, one cutting in front of the other at up to
 20 m/s with a few metres of GPS/EKF error, is a genuine collision risk —
@@ -54,44 +60,27 @@ import socket
 import sys
 import threading
 import time
+import traceback
 
 from pymavlink import mavutil
 
-# vendored trajectory planner (byte-for-byte; Gazebo dep neutralised)
-from fpv_gate_il.gate_gps import GateGpsSample
-from fpv_gate_il.trajectory.config import TrajectoryConfig
-from fpv_gate_il.trajectory.coords import latlonalt_to_local
-from fpv_gate_il.trajectory.mav_bridge import (
-    CarrotDirSlew,
-    CatchupSpeedLatch,
-    PositionSetpointHold,
-    SpeedCommandSlew,
-    apply_planner_output,
-    traj_hold_alt_m,
+# The trajectory brain (vendored planner + session glue) lives in chase_core so
+# the laptop (this file) and the Orin (chase_orin.py) fly identical logic.
+from chase_core import (
+    TrackController,
+    add_planner_args,
+    build_traj_config,
+    chaser_home_amsl,
+    format_altitude,
+    has_fix,
+    haversine_m,
+    print_plan_banner,
+    print_initial_separation,
+    validate_altitude_options,
+    warn_offset_vs_minsep,
 )
-from fpv_gate_il.trajectory.pipeline import TrajectoryPipeline
-from fpv_gate_il.trajectory.radar import RadarMeasurement
-from fpv_gate_il.trajectory.types import DroneState, NedVelocity
-
 from chaser_env import ChaserEnv
 from link_log import LinkLogger
-
-EARTH_R = 6371000.0
-
-
-# ---------------------------------------------------------------- geometry
-def haversine_m(lat1, lon1, lat2, lon2):
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * EARTH_R * math.asin(math.sqrt(a))
-
-
-def has_fix(s):
-    """3D fix and a real coordinate (reject 0,0 'null island')."""
-    if s["lat"] is None or s["fix"] < 3:
-        return False
-    return not (abs(s["lat"]) < 1e-6 and abs(s["lon"]) < 1e-6)
 
 
 # ---------------------------------------------------------------- recording trigger
@@ -171,13 +160,19 @@ class Recorder:
 class Vehicle:
     """Telemetry link + receive thread (lifted from follow_relay, plus on_msg).
 
+    The receive thread is the ONLY reader of the link. It records what the
+    brain needs (position with an exact arrival stamp, fix, mode, attitude)
+    and PARAM_VALUE replies, which ChaserEnv waits on via wait_param() rather
+    than reading the link itself (two readers on one link race each other).
+
     on_msg(name, msg, t_mono) is called for every received message so link_log
     can record per-message health without changing the snapshot contract.
     """
 
-    def __init__(self, name, port, baud, stream_hz=10.0, on_msg=None):
+    def __init__(self, name, port, baud, stream_hz=10.0, on_msg=None, att_hz=0.0):
         self.name = name
         self.stream_hz = stream_hz
+        self.att_hz = float(att_hz or 0.0)
         self.on_msg = on_msg
         print(f"[{name}] {port} @ {baud} baglaniliyor...")
         self.conn = mavutil.mavlink_connection(port, baud=baud, source_system=250)
@@ -196,23 +191,32 @@ class Vehicle:
         self.mode = "?"
         self.armed = False
         self.last_pos_t = 0.0
+        self.pos_mono = None          # exact monotonic arrival of the newest position
         self.last_raw = None
+        self.roll = self.pitch = self.yaw = None
+        self.last_att_mono = None
         self.pos_times = collections.deque(maxlen=40)
         self.lock = threading.Lock()
+        self._params = {}             # name -> (value, t_mono)
+        self._param_cv = threading.Condition()
 
         self._request_streams()
         threading.Thread(target=self._rx_loop, daemon=True).start()
 
     def _request_streams(self):
-        # 33 = GLOBAL_POSITION_INT, 24 = GPS_RAW_INT
-        for msg_id, hz in ((33, self.stream_hz), (24, 1)):
+        # Addressed to our own vehicle explicitly (sysid locked at connect).
+        # 33 = GLOBAL_POSITION_INT, 24 = GPS_RAW_INT, 30 = ATTITUDE (yaw = the
+        # planner's "nose" while hovering, as in the sim).
+        tsys, tcomp = self.sysid, self.conn.target_component
+        intervals = [(33, self.stream_hz), (24, 1.0)]
+        if self.att_hz > 0:
+            intervals.append((30, self.att_hz))
+        for msg_id, hz in intervals:
             self.conn.mav.command_long_send(
-                self.conn.target_system, self.conn.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                tsys, tcomp, mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
                 msg_id, int(1e6 / hz), 0, 0, 0, 0, 0)
         self.conn.mav.request_data_stream_send(
-            self.conn.target_system, self.conn.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION, int(self.stream_hz), 1)
+            tsys, tcomp, mavutil.mavlink.MAV_DATA_STREAM_POSITION, int(self.stream_hz), 1)
 
     def _rx_loop(self):
         while True:
@@ -235,6 +239,7 @@ class Vehicle:
                     self.vy = msg.vy / 100.0
                     self.vz = msg.vz / 100.0
                     self.last_pos_t = time.time()
+                    self.pos_mono = t_mono
                     self.pos_times.append(self.last_pos_t)
                     self.last_raw = msg.get_msgbuf()
                 elif t == "GPS_RAW_INT":
@@ -243,8 +248,13 @@ class Vehicle:
                     self.mode = mavutil.mode_string_v10(msg)
                     self.armed = bool(msg.base_mode &
                                       mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                elif t == "ATTITUDE" and msg.get_srcSystem() == self.sysid:
+                    self.roll, self.pitch, self.yaw = msg.roll, msg.pitch, msg.yaw
+                    self.last_att_mono = t_mono
                 elif t == "STATUSTEXT":
                     print(f"\n[{self.name} FC] {msg.text}")
+            if t == "PARAM_VALUE" and msg.get_srcSystem() == self.sysid:
+                self._note_param(msg, t_mono)
             # link telemetry logging (outside the state lock)
             if self.on_msg is not None:
                 try:
@@ -252,26 +262,48 @@ class Vehicle:
                 except Exception:
                     pass
 
+    def _note_param(self, msg, t_mono):
+        pid = msg.param_id
+        if isinstance(pid, bytes):
+            pid = pid.decode("utf-8", errors="ignore")
+        pid = pid.rstrip("\x00")
+        with self._param_cv:
+            self._params[pid] = (float(msg.param_value), t_mono)
+            self._param_cv.notify_all()
+
+    def wait_param(self, name, *, since_mono, timeout):
+        """Value of `name` from a PARAM_VALUE that arrived after since_mono,
+        or None on timeout. Fed by the receive thread (the only reader)."""
+        deadline = time.monotonic() + float(timeout)
+        with self._param_cv:
+            while True:
+                rec = self._params.get(name)
+                if rec is not None and rec[1] >= since_mono:
+                    return rec[0]
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._param_cv.wait(remaining)
+
     def snapshot(self):
         with self.lock:
             ts = list(self.pos_times)
             hz = 0.0
             if len(ts) >= 3 and ts[-1] > ts[0]:
                 hz = (len(ts) - 1) / (ts[-1] - ts[0])
+            now_mono = time.monotonic()
+            att_age = (now_mono - self.last_att_mono) if self.last_att_mono is not None else None
             return dict(lat=self.lat, lon=self.lon, alt_amsl=self.alt_amsl,
                         alt_rel=self.alt_rel, vx=self.vx, vy=self.vy, vz=self.vz,
                         fix=self.fix, nsat=self.nsat, mode=self.mode,
                         armed=self.armed, age=time.time() - self.last_pos_t,
-                        hz=hz, raw=self.last_raw)
+                        hz=hz, raw=self.last_raw, pos_mono=self.pos_mono,
+                        roll=self.roll, pitch=self.pitch, yaw=self.yaw, att_age=att_age)
 
     @staticmethod
     def home_amsl(s):
-        """Chaser home AMSL = alt_amsl - alt_rel. Constant through a flight even
-        as the baro drifts (both fields drift together), so it is the stable
-        reference for cross-vehicle altitude math."""
-        if s["alt_amsl"] is None or s["alt_rel"] is None:
-            return None
-        return s["alt_amsl"] - s["alt_rel"]
+        """Chaser home AMSL = alt_amsl - alt_rel (see chase_core)."""
+        return chaser_home_amsl(s)
 
     def set_mode(self, name, timeout=4.0):
         mapping = self.conn.mode_mapping()
@@ -303,50 +335,12 @@ def main():
                          "Carrot her tikte kaydigi icin stream-hz'ten yuksek olabilir.")
     ap.add_argument("--stream-hz", type=float, default=10.0,
                     help="telemetriden konum isteme hizi (Hz). Link bogulursa dusur.")
+    ap.add_argument("--att-hz", type=float, default=2.0,
+                    help="takipci ATTITUDE isteme hizi (Hz). Planlayici hover'da "
+                         "burun yonu olarak yaw kullanir (sim ile ayni). 0 = isteme.")
 
-    # --- trajectory planner (peak speed fix + adaptive schedule) ---
-    ap.add_argument("--max-speed", type=float, default=20.0,
-                    help="uzaktaki tepe hiz (m/s). WP_SPD tavani + DO_CHANGE_SPEED "
-                         "buna gore kurulur (eski 'hep 10' hatasi burada cozulur).")
-    ap.add_argument("--deadline-range", type=float, default=100.0,
-                    help="bu mesafede hiz close-approach'a iner (m). Varsayilan 100.")
-    ap.add_argument("--close-approach", type=float, default=10.0,
-                    help="deadline icindeki yaklasma hizi (m/s)")
-    ap.add_argument("--decel-start-range", type=float, default=200.0,
-                    help="bu mesafeden itibaren tepe hizdan yavaslamaya basla (m). "
-                         "Varsayilan 200: ~200 m'ye kadar tam hiz, 200->100 arasi iner.")
-    ap.add_argument("--accel", type=float, default=4.0,
-                    help="WP_ACC / planlayici ivme siniri (m/s^2)")
-    ap.add_argument("--carrot", type=float, default=250.0,
-                    help="carrot on-bakis mesafesi (m)")
-    ap.add_argument("--time-margin", type=float, default=2.5,
-                    help="intercept zaman marji (s)")
-
-    # --- altitude ---
-    ap.add_argument("--alt-offset", type=float, default=-3.0,
-                    help="hedefin irtifasina gore ofset (m). POZITIF = ustunde, "
-                         "NEGATIF = altinda. Her tik yeniden hesaplanir (latch yok). "
-                         "Varsayilan -3: unutulsa bile 3 m altta bir dikey marj.")
-    ap.add_argument("--alt-match", dest="alt_match", action="store_true", default=True,
-                    help="temiz irtifa modu (VARSAYILAN ACIK): dogrudan hedef_irtifa "
-                         "+ offset'e ucus, dosyanin balon temizlik/tavan mantigi devrede degil.")
-    ap.add_argument("--no-alt-match", dest="alt_match", action="store_false",
-                    help="temiz modu KAPAT; dosyanin orijinal balon temizlik/tavan "
-                         "mantigina don (alcak hedefin ustunden gec, 50 m'de sinirla).")
-    ap.add_argument("--sep-bias", type=float, default=0.0,
-                    help="iki drone GERCEKTEN ayni seviyedeyken okunan dikey ayrim. "
-                         "Once --dry-run ile olc, buraya gir.")
-    ap.add_argument("--min-alt", type=float, default=10.0,
-                    help="komut irtifasi alt siniri (m, chaser home ustu)")
-
-    # --- safety ---
-    ap.add_argument("--min-sep", type=float, default=0.0,
-                    help="OLCULEN dikey ayrim |sep| bunun altina inerse komut kesilir "
-                         "(m). 0 = KAPALI. Intercept dogal olarak yaklastigi icin "
-                         "varsayilan kapali; ayni irtifada gecis icin 0 birak.")
-    ap.add_argument("--max-dist", type=float, default=1000.0, help="guvenlik kelepcesi (m)")
-    ap.add_argument("--max-age", type=float, default=3.0,
-                    help="hedef konumu bayatlama siniri (s)")
+    # --- planner / altitude / safety / posvel: shared with the Orin (chase_core) ---
+    add_planner_args(ap)
 
     # --- recording (kept as flags) ---
     ap.add_argument("--rec-start", type=float, default=150.0, help="bu mesafede kayda basla (m)")
@@ -354,11 +348,6 @@ def main():
     ap.add_argument("--rec-host", default="192.168.144.50", help="Orin IP")
     ap.add_argument("--rec-port", type=int, default=5599)
     ap.add_argument("--no-rec", action="store_true", help="kayit tetigini kapat")
-
-    # --- posvel (kept as flag) ---
-    ap.add_argument("--posvel", action="store_true",
-                    help="komuta hedefin hizini da kat (ileri besleme). Carrot "
-                         "planlayicida nadiren gerekir; sabit hedefte gereksiz.")
 
     # --- logging ---
     ap.add_argument("--no-log", action="store_true",
@@ -373,14 +362,14 @@ def main():
     ap.add_argument("--set-mode", action="store_true", help="modu script degistirsin (GUIDED)")
     ap.add_argument("--dry-run", action="store_true", help="FC'ye komut gonderme")
     a = ap.parse_args()
+    try:
+        validate_altitude_options(a.alt_ref, a.sep_bias, a.alt_offset)
+    except ValueError as e:
+        ap.error(str(e))
 
     if a.rec_stop >= a.rec_start:
         sys.exit("[X] --rec-stop, --rec-start'tan kucuk olmali.")
-    if a.min_sep and a.min_sep > 0 and abs(a.alt_offset) < a.min_sep:
-        print(f"[!] UYARI: |--alt-offset|={abs(a.alt_offset):.0f} m < --min-sep={a.min_sep:.0f} m. "
-              f"Dikey ayrim sigortasi amaclanan yakin geciste tetiklenir. "
-              f"Ayni irtifada intercept istiyorsan --min-sep 0 ver, ya da "
-              f"|--alt-offset|'i buyut.", flush=True)
+    warn_offset_vs_minsep(a)
 
     # link logger first, so we hook both vehicles' receive threads
     link_log = LinkLogger(
@@ -391,6 +380,8 @@ def main():
             "deadline_range_m": a.deadline_range,
             "close_approach_mps": a.close_approach,
             "alt_offset_m": a.alt_offset,
+            "alt_ref": a.alt_ref,
+            "sep_bias_m": a.sep_bias,
             "alt_match": int(a.alt_match),
             "posvel": int(a.posvel),
             "stream_hz": a.stream_hz,
@@ -408,7 +399,7 @@ def main():
         link_log.cmd_lat.note_ack(msg, t_mono)
 
     chaser = Vehicle("TAKIPCI", a.chaser_port, a.chaser_baud, a.stream_hz,
-                     on_msg=_chaser_on_msg)
+                     on_msg=_chaser_on_msg, att_hz=a.att_hz)
 
     if target.sysid == chaser.sysid:
         print(f"\n[!] IKI DRONE DE sysid={target.sysid}. GUIDED'da calisir ama "
@@ -433,19 +424,18 @@ def main():
     if ts["lat"] is None or cs["lat"] is None:
         sys.exit("[X] Iki drone'dan da konum gelmedi.")
 
-    print(f"  HEDEF  : {ts['lat']:.7f}, {ts['lon']:.7f}  amsl={ts['alt_amsl']:.1f} "
-          f"rel={ts['alt_rel']:.1f}  fix={ts['fix']}/{ts['nsat']}  mod={ts['mode']}  "
+    print(f"  HEDEF  : {ts['lat']:.7f}, {ts['lon']:.7f}  amsl={format_altitude(ts.get('alt_amsl'))} "
+          f"rel={format_altitude(ts.get('alt_rel'))}  fix={ts['fix']}/{ts['nsat']}  mod={ts['mode']}  "
           f"gelen={ts['hz']:.1f} Hz")
-    print(f"  TAKIPCI: {cs['lat']:.7f}, {cs['lon']:.7f}  amsl={cs['alt_amsl']:.1f} "
-          f"rel={cs['alt_rel']:.1f}  fix={cs['fix']}/{cs['nsat']}  mod={cs['mode']}  "
+    print(f"  TAKIPCI: {cs['lat']:.7f}, {cs['lon']:.7f}  amsl={format_altitude(cs.get('alt_amsl'))} "
+          f"rel={format_altitude(cs.get('alt_rel'))}  fix={cs['fix']}/{cs['nsat']}  mod={cs['mode']}  "
           f"gelen={cs['hz']:.1f} Hz")
     print(f"  [i] istenen {a.stream_hz:.0f} Hz - 'gelen' bunun cok altindaysa "
           f"telemetri linki doymus demektir")
     if has_fix(ts) and has_fix(cs):
         print(f"  aralarindaki mesafe: "
               f"{haversine_m(cs['lat'], cs['lon'], ts['lat'], ts['lon']):.0f} m")
-        print(f"  olculen dikey ayrim: {ts['alt_amsl'] - cs['alt_amsl']:+.1f} m "
-              f"(+ = takipci altta)")
+        print_initial_separation(a, ts, cs)
     else:
         for tag, st in (("HEDEF", ts), ("TAKIPCI", cs)):
             if not has_fix(st):
@@ -455,47 +445,18 @@ def main():
     # --- fixed NED origin = chaser startup lat/lon (planner works in this frame) ---
     if not has_fix(cs):
         sys.exit("[X] Takipci 3D fix olmadan yorunge cercevesi kurulamaz.")
-    cfg = TrajectoryConfig(
-        home_lat_deg=float(cs["lat"]),
-        home_lon_deg=float(cs["lon"]),
-        home_alt_m=0.0,  # coords ignore this; command alt comes from traj_hold_alt_m(gate)
-        max_speed_mps=float(a.max_speed),
-        deadline_range_m=float(a.deadline_range),
-        close_approach_speed_mps=float(a.close_approach),
-        speed_decel_start_range_m=float(a.decel_start_range),
-        max_acceleration_mps2=float(a.accel),
-        path_carrot_lookahead_m=float(a.carrot),
-        time_margin_s=float(a.time_margin),
-    )
-    if a.alt_match:
-        cfg.traj_alt_match_above_m = -1.0e9  # traj_hold_alt_m returns gate alt unchanged
-
-    pipeline = TrajectoryPipeline(cfg)
-    pipeline.soft_reset_guidance(realign=False)
+    cfg = build_traj_config(a, cs["lat"], cs["lon"])
     chaser_env = ChaserEnv(chaser, verbose_speed=False, cmd_latency=link_log.cmd_lat)
     chaser_env.enable_posvel(a.posvel)
-    speed_slew = SpeedCommandSlew.from_config(cfg)
-    pos_hold = PositionSetpointHold.from_config(cfg)
-    dir_slew = CarrotDirSlew.from_config(cfg)
-    catchup = CatchupSpeedLatch()
+    ctl = TrackController(
+        cfg, chaser_env, alt_offset=a.alt_offset, sep_bias=a.sep_bias, alt_ref=a.alt_ref,
+        min_alt=a.min_alt, min_sep=a.min_sep, max_dist=a.max_dist,
+        max_age=a.max_age, posvel=a.posvel, dry_run=a.dry_run,
+        cmd_lat=link_log.cmd_lat,
+        att_max_age_s=max(1.0, 3.0 / a.att_hz) if a.att_hz > 0 else 1.0,
+    )
 
-    # --- plan banner ---
-    where = "ustunde" if a.alt_offset > 0 else ("altinda" if a.alt_offset < 0 else "ayni irtifada")
-    print(f"\n  plan   : takipci hedefi kovalar; karsidan gelirsen ONUNU KESER (intercept), "
-          f"caprazda ARKADAN takip eder (follow) - kisitsiz.")
-    print(f"  hiz    : uzakta {a.max_speed:.0f} m/s, {a.deadline_range:.0f} m icinde "
-          f"{a.close_approach:.0f} m/s'e iner (adaptif). WP_ACC={a.accel:.0f}.")
-    print(f"  irtifa : hedefin {abs(a.alt_offset):.0f} m {where}"
-          + (" (alt-match: dogrudan)" if a.alt_match else " (dosya temizlik/tavan mantigi)")
-          + f"; alt sinir {a.min_alt:.0f} m")
-    print(f"  komut  : {'pozisyon + hiz (posvel)' if a.posvel else 'pozisyon + yaw'}")
-    if a.min_sep and a.min_sep > 0:
-        print(f"  sigorta: olculen |dikey ayrim| < {a.min_sep:.0f} m ise komut kesilir")
-    else:
-        print(f"  sigorta: --min-sep 0 (KAPALI). Carpisma sorumlulugu pilotta - "
-              f"RC'de moda hazir dur, dikey ofset ver.")
-    if a.sep_bias:
-        print(f"  duzeltme: ayrim okumasindan {a.sep_bias:+.1f} m cikariliyor")
+    print_plan_banner(a)
     if rec:
         print(f"  kayit  : {a.rec_start:.0f} m'de basla, {a.rec_stop:.0f} m'de dur, "
               f"sadece yaklasirken")
@@ -521,14 +482,11 @@ def main():
 
     print("Ctrl-C -> takipci LOITER. Kumanda her an ezer.\n")
     period = 1.0 / a.rate
-    sent = skipped = 0
-    last_out = None
-    last_target_pos_t = None
-    speed_seeded = False
+    skipped = 0
+    pilot_exit = False
     last_stream_req = time.monotonic()
     last_ping = time.monotonic()
-    last_armed_speed = None
-    last_speed = None
+    warned_course = False
 
     try:
         while True:
@@ -536,28 +494,10 @@ def main():
             now = time.monotonic()
             ts, cs = target.snapshot(), chaser.snapshot()
 
-            # --- safety gates ---
-            why, d, sep = None, 0.0, 0.0
-            if ts["lat"] is None or cs["lat"] is None:
-                why = "konum paketi henuz gelmedi"
-            elif not has_fix(ts):
-                why = f"HEDEF GPS yok (fix={ts['fix']}, sat={ts['nsat']})"
-            elif not has_fix(cs):
-                why = f"TAKIPCI GPS yok (fix={cs['fix']}, sat={cs['nsat']})"
-            elif ts["age"] > a.max_age:
-                why = f"hedef konumu {ts['age']:.1f} s bayat"
-            else:
-                d = haversine_m(cs["lat"], cs["lon"], ts["lat"], ts["lon"])
-                sep = (ts["alt_amsl"] - cs["alt_amsl"]) - a.sep_bias
-                if d > a.max_dist:
-                    why = f"mesafe {d:.0f} m > kelepce {a.max_dist:.0f} m"
-                elif a.min_sep and a.min_sep > 0 and abs(sep) < a.min_sep:
-                    why = (f"!! DIKEY AYRIM {sep:+.1f} m ({abs(sep):.1f} < {a.min_sep:.0f}) "
-                           f"- KOMUT KESILDI, KUMANDAYA GEC")
-
-            # pilot took over?
+            # pilot took over? -> hand back, never touch the mode again
             if not a.dry_run and cs["mode"] not in ("GUIDED",):
                 print(f"\n[!] Takipci modu {cs['mode']} oldu. Kontrol kumandada, cikiliyor.")
+                pilot_exit = True
                 break
 
             # periodic stream re-request (safe on a lossy link; never re-asserts mode)
@@ -578,131 +518,61 @@ def main():
                     pass
                 last_ping = now
 
-            if why:
+            k = ctl.tick(ts, cs, now)
+
+            if k.why:
                 skipped += 1
-                print(f"  [BEKLE] {why}")
+                print(f"  [BEKLE] {k.why}" + ("  -> takipci yerinde tutuluyor" if k.held else ""))
                 link_log.note_relay(
                     t_mono=now, updated=False,
                     target_age_ms=ts["age"] * 1e3, chaser_age_ms=cs["age"] * 1e3,
-                    compute_ms=None, send_ms=None, behavior="wait", follow_phase=why[:16],
-                    v_cmd_mps=None, dist_m=d if d else None, sep_m=sep if sep else None,
+                    compute_ms=None, send_ms=None,
+                    behavior="hold" if k.held else "wait", follow_phase=k.why[:16],
+                    v_cmd_mps=None, dist_m=k.d, sep_m=k.sep,
                     gate_alt_m=None, target_hz=ts["hz"], chaser_hz=cs["hz"])
-                time.sleep(max(0.0, period - (time.time() - loop_t)))
-                continue
-
-            if rec:
-                evt = rec.update(d, loop_t)
-                if evt:
-                    print(f"  >>> {evt}")
-
-            # --- drone state in the fixed chaser-home NED frame ---
-            chome = Vehicle.home_amsl(cs)
-            if chome is None:
-                skipped += 1
-                print("  [BEKLE] takipci home AMSL cozulemedi")
-                time.sleep(max(0.0, period - (time.time() - loop_t)))
-                continue
-            c_ned = latlonalt_to_local(cs["lat"], cs["lon"], cs["alt_rel"],
-                                       home_lat_deg=cfg.home_lat_deg,
-                                       home_lon_deg=cfg.home_lon_deg,
-                                       home_alt_m=cfg.home_alt_m)
-            drone = DroneState(
-                position=c_ned,
-                velocity=NedVelocity(float(cs["vx"]), float(cs["vy"]), float(cs["vz"])),
-                timestamp_s=now,
-                speed_mps=math.hypot(cs["vx"], cs["vy"]),
-                heading_rad=math.atan2(cs["vy"], cs["vx"]),
-            )
-
-            # --- only feed the KF on a genuinely new target fix (no duplicates) ---
-            compute_ms = None
-            updated = False
-            if ts["last_raw"] is not None:
-                pass  # (raw not needed; we build the measurement from fields)
-            target_pos_t = loop_t - ts["age"]  # wall time of the newest target fix
-            if last_target_pos_t is None or (target_pos_t - last_target_pos_t) > 1e-3:
-                last_target_pos_t = target_pos_t
-                # target altitude expressed in the chaser-home-relative frame
-                gate_alt = (ts["alt_amsl"] - a.sep_bias - chome) + a.alt_offset
-                spd = math.hypot(ts["vx"], ts["vy"])
-                meas = RadarMeasurement(
-                    timestamp_s=now,
-                    latitude_deg=float(ts["lat"]),
-                    longitude_deg=float(ts["lon"]),
-                    altitude_up_m=float(gate_alt),
-                    ground_speed_mps=spd if spd > 0.05 else None,
-                    course_rad=(math.atan2(ts["vy"], ts["vx"]) if spd > 0.05 else None),
-                )
-                t_c0 = time.monotonic()
-                last_out = pipeline.update(meas, drone)
-                compute_ms = (time.monotonic() - t_c0) * 1e3
-                updated = True
-
-            # --- gate sample (chaser-relative alt) every tick; min-alt floor ---
-            gate_alt = (ts["alt_amsl"] - a.sep_bias - chome) + a.alt_offset
-            rng = last_out.distance_to_target_m if last_out is not None else None
-            preview = traj_hold_alt_m(gate_alt, cfg, range_m=rng)
-            if preview < a.min_alt:
-                gate_alt += (a.min_alt - preview)  # bump so commanded alt >= floor
-            gate = GateGpsSample(lat=float(ts["lat"]), lon=float(ts["lon"]),
-                                 alt=float(gate_alt), recv_mono=now)
-
-            # --- drive the chaser ---
-            send_ms = None
-            if last_out is not None and not a.dry_run:
-                chaser_env.refresh_from_snapshot(cs)
-                if a.posvel:
-                    chaser_env.set_feedforward_velocity(cs["vx"], cs["vy"], cs["vz"])
-                if not speed_seeded:
-                    speed_slew.reset(float(drone.speed_mps))
-                    speed_seeded = True
-                t_s0 = time.monotonic()
-                last_speed = apply_planner_output(
-                    chaser_env, last_out, gate=gate, drone=drone, config=cfg,
-                    last_speed_cmd=last_speed, speed_slew=speed_slew, pos_hold=pos_hold,
-                    dir_slew=dir_slew, catchup=catchup, now_s=now,
-                )
-                send_ms = (time.monotonic() - t_s0) * 1e3
-                sent += 1
-
-            # command->response speed-reaction sampling (includes FC + accel)
-            chaser_gs = math.hypot(cs["vx"], cs["vy"])
-            if last_speed is not None:
-                if last_armed_speed is None or abs(last_speed - last_armed_speed) >= 1.5:
-                    link_log.cmd_lat.arm_speed(chaser_gs, last_speed, now)
-                    last_armed_speed = last_speed
-            link_log.cmd_lat.note_gs(chaser_gs, now)
-
-            # --- status + latency log ---
-            beh = last_out.behavior.value if (last_out and last_out.behavior) else "-"
-            fp = last_out.follow_phase.value if last_out else "-"
-            cmd_alt = traj_hold_alt_m(gate_alt, cfg, range_m=rng)
-            spd = math.hypot(ts["vx"], ts["vy"])
-            rstate = rec.state if rec else "-"
-            vshow = last_speed if last_speed is not None else 0.0
-            print(f"  d={d:6.1f} m  ayrim={sep:+5.1f} m  beh={beh:9s} fp={fp:5s}  "
-                  f"v_cmd={vshow:4.1f}  komut_alt={cmd_alt:5.1f} m  hedef_hiz={spd:4.1f}  "
-                  f"yas={ts['age']:.2f}s  hz={ts['hz']:.1f}  rec={rstate}  n={sent}")
-            link_log.note_relay(
-                t_mono=now, updated=updated,
-                target_age_ms=ts["age"] * 1e3, chaser_age_ms=cs["age"] * 1e3,
-                compute_ms=compute_ms, send_ms=send_ms, behavior=beh, follow_phase=fp,
-                v_cmd_mps=last_speed, dist_m=d, sep_m=sep, gate_alt_m=cmd_alt,
-                target_hz=ts["hz"], chaser_hz=cs["hz"])
+            else:
+                if rec:
+                    evt = rec.update(k.d, loop_t)
+                    if evt:
+                        print(f"  >>> {evt}")
+                if k.heading_src == "course" and not warned_course and a.att_hz > 0:
+                    print("  [!] takipci ATTITUDE gelmiyor - hover'da burun yerine hiz "
+                          "yonu kullaniliyor (--att-hz / link kontrol)")
+                    warned_course = True
+                rstate = rec.state if rec else "-"
+                vshow = k.v_cmd if k.v_cmd is not None else 0.0
+                print(f"  d={k.d:6.1f} m  ayrim={k.sep:+5.1f} m  beh={k.behavior:9s} "
+                      f"fp={k.follow_phase:5s}  v_cmd={vshow:4.1f}  komut_alt={k.cmd_alt:5.1f} m  "
+                      f"hedef_hiz={k.target_speed:4.1f}  yas={ts['age']:.2f}s  "
+                      f"hz={ts['hz']:.1f}  rec={rstate}  n={ctl.sent}")
+                link_log.note_relay(
+                    t_mono=now, updated=k.updated,
+                    target_age_ms=ts["age"] * 1e3, chaser_age_ms=cs["age"] * 1e3,
+                    compute_ms=k.compute_ms, send_ms=k.send_ms, behavior=k.behavior,
+                    follow_phase=k.follow_phase, v_cmd_mps=k.v_cmd, dist_m=k.d,
+                    sep_m=k.sep, gate_alt_m=k.cmd_alt,
+                    target_hz=ts["hz"], chaser_hz=cs["hz"])
 
             time.sleep(max(0.0, period - (time.time() - loop_t)))
 
     except KeyboardInterrupt:
         print("\n[i] Durduruldu.")
-
-    print(f"[i] gonderim={sent} atlanan={skipped}")
-    link_log.close()
-    if rec:
-        rec.shutdown()
-    if not a.dry_run:
-        print("[i] Takipci LOITER'a aliniyor...")
-        chaser.set_mode("LOITER")
-        time.sleep(1)
+    except Exception:
+        traceback.print_exc()
+        print("[X] Beklenmeyen hata - dongu durdu.")
+    finally:
+        print(f"[i] gonderim={ctl.sent} yerinde-tut={ctl.holds} atlanan={skipped}")
+        link_log.close()
+        if rec:
+            rec.shutdown()
+        if not a.dry_run:
+            if pilot_exit or chaser.mode != "GUIDED":
+                # The pilot chose a mode: never override it (their abort is the safety).
+                print(f"[i] Kontrol pilotta (mod={chaser.mode}); mod degistirilmiyor.")
+            else:
+                print("[i] Takipci LOITER'a aliniyor...")
+                chaser.set_mode("LOITER")
+                time.sleep(1)
 
 
 if __name__ == "__main__":

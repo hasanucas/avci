@@ -64,6 +64,8 @@ class ChaserEnv:
         # DO_CHANGE_SPEED throttle state (see set_guided_horizontal_speed_mps)
         self._wp_spd_mps = -1.0
         self._wp_spd_cmd_t = 0.0
+        # >0: the next N speed commands bypass the throttle (see force_speed_resend)
+        self._force_speed_n = 0
         # live global position, refreshed each tick from the Vehicle snapshot
         self._mavlink_global_valid = False
         self._mavlink_lat_deg = 0.0
@@ -209,6 +211,20 @@ class ChaserEnv:
             0.0,
         )
 
+    def force_speed_resend(self, n: int = 3) -> None:
+        """Send the next `n` DO_CHANGE_SPEED commands regardless of the throttle.
+
+        Needed when GUIDED is RE-ENTERED after the pilot flew (chase_orin's
+        pause/resume): ArduCopter re-reads WP_SPD (= the raised ceiling) into the
+        active speed when the first GUIDED position target after (re)entry
+        starts, so our remembered "last speed sent" is no longer what the FC is
+        using. With the throttle alone, a steady commanded speed would never be
+        re-sent and the chaser would fly at the ceiling instead of the planner's
+        speed. The planner sends speed BEFORE position within a tick, so the
+        first command can land before the FC resets; a few repeats make sure one
+        arrives after it."""
+        self._force_speed_n = max(0, int(n))
+
     def set_guided_horizontal_speed_mps(
         self,
         speed_mps: float,
@@ -225,10 +241,13 @@ class ChaserEnv:
         last_t = float(self._wp_spd_cmd_t)
         min_dt = max(0.0, float(min_interval_s))
         min_dv = max(0.05, float(min_delta_mps))
-        if prev >= 0.0 and abs(spd - prev) < min_dv:
-            return
-        if prev >= 0.0 and min_dt > 0.0 and (now - last_t) < min_dt:
-            return
+        if self._force_speed_n > 0:
+            self._force_speed_n -= 1   # forced: skip both throttles below
+        else:
+            if prev >= 0.0 and abs(spd - prev) < min_dv:
+                return
+            if prev >= 0.0 and min_dt > 0.0 and (now - last_t) < min_dt:
+                return
         self._wp_spd_mps = spd
         self._wp_spd_cmd_t = now
         # SPEED_TYPE_GROUNDSPEED = 1
@@ -292,36 +311,44 @@ class ChaserEnv:
             if self._verbose_param:
                 print(f"[MAV] param {name} = {value_f}", flush=True)
             return True
+        t0 = time.monotonic()
         self.mav.mav.param_request_read_send(
             self.mav.target_system, self.mav.target_component,
             name.encode("utf-8"), -1,
         )
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self.mav.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
-            if msg is None:
-                continue
-            pid = msg.param_id
-            if isinstance(pid, bytes):
-                pid = pid.decode("utf-8", errors="ignore")
-            pid = pid.rstrip("\x00")
-            if pid != name:
-                continue
-            ok = abs(float(msg.param_value) - value_f) <= max(0.05, abs(value_f) * 0.05)
-            status = "OK" if ok else f"got {msg.param_value}"
-            print(f"[MAV] param {name} = {value_f} ({status})", flush=True)
-            return ok
-        print(f"[MAV] WARNING: param {name} = {value_f} (no ACK within {timeout:.0f}s)",
-              flush=True)
-        return False
+        got = self._await_param(name, since_mono=t0, timeout=timeout)
+        if got is None:
+            print(f"[MAV] WARNING: param {name} = {value_f} (no ACK within {timeout:.0f}s)",
+                  flush=True)
+            return False
+        ok = abs(float(got) - value_f) <= max(0.05, abs(value_f) * 0.05)
+        status = "OK" if ok else f"got {got}"
+        print(f"[MAV] param {name} = {value_f} ({status})", flush=True)
+        return ok
 
     def _get_param(self, name: str, *, timeout: float = 2.0) -> float | None:
         if self.mav is None or self.mav.target_system == 0:
             return None
+        t0 = time.monotonic()
         self.mav.mav.param_request_read_send(
             self.mav.target_system, self.mav.target_component,
             name.encode("utf-8"), -1,
         )
+        return self._await_param(name, since_mono=t0, timeout=timeout)
+
+    def _await_param(self, name: str, *, since_mono: float, timeout: float) -> float | None:
+        """Wait for a PARAM_VALUE for `name` that arrived after `since_mono`.
+
+        In the field the vehicle's receive thread is the ONLY reader of the
+        link and records PARAM_VALUE (vehicle.wait_param). Calling recv_match
+        here as well would make two threads read the same stream: the RX
+        thread steals the reply (spurious "read-back timed out") and parser
+        state can interleave. (Bug fix.) Without a waiter (offline/sim use),
+        fall back to reading the link directly as the sim env did.
+        """
+        waiter = getattr(self.vehicle, "wait_param", None)
+        if callable(waiter):
+            return waiter(name, since_mono=since_mono, timeout=timeout)
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self.mav.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
