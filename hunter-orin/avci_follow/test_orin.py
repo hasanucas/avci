@@ -14,8 +14,13 @@ hardware.
   6) round trip: target frames -> relay -> (chaser FC routing) -> Orin parser
      -> hub, interleaved with the chaser's own frames and MAVProxy's
   7) orchestrator loop (virtual clock): dry-run, real run pinned to sysid 1
-     with WP_SPD confirmation, pilot takeover, stale hold, target missing,
-     operator cancel; chase_state CSV written
+     with WP_SPD confirmation, --exit-on-pilot (old takeover exit), stale
+     hold, target missing, operator cancel; chase_state CSV written
+  7b) pilot pause/resume: a scripted RC switch (GUIDED -> LOITER -> GUIDED ...)
+     — while the pilot has the chaser ZERO bytes go to the FC and the script
+     does not exit; on GUIDED it resumes with a fresh controller, speed seeded
+     from the real groundspeed and re-sent after the first position targets;
+     the mode is never overridden; Ctrl-C while paused leaves their mode alone
   8) live pymavlink UDP link to a MAVProxy stand-in, RX thread running: the
      target's heartbeat arrives first (pymavlink locks onto it), commands
      still reach sysid 1, param read-back through the live thread
@@ -328,20 +333,86 @@ class FakeHub:
         return ChaserHandle(PinnedLink(self.conn, 1, 1), self.chaser)
 
 
-def run_orin(argv, *, budget_s=10.0, world_kw=None, answer="evet", target_ok=True):
+def run_orin(argv, *, budget_s=10.0, world_kw=None, answer="evet", target_ok=True,
+             world_cls=World):
     clock = FakeTime(budget_s)
-    world = World(clock, **(world_kw or {}))
+    world = world_cls(clock, **(world_kw or {}))
     hub = FakeHub(world, clock, target_ok=target_ok)
+    if hasattr(world, "attach"):
+        world.attach(hub)
     a = chase_orin.build_parser().parse_args(argv)
     saved = builtins.input
     builtins.input = lambda *x: answer
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            code = chase_orin.Orchestrator(a, hub, clock=clock).run()
+            hub.orch = chase_orin.Orchestrator(a, hub, clock=clock)
+            code = hub.orch.run()
     finally:
         builtins.input = saved
     return code, buf.getvalue(), hub
+
+
+class PilotWorld(World):
+    """The pilot works the RC mode switch on a script.
+
+    schedule = [(t_s, mode), ...]: seconds since the start, the last entry at or
+    before now wins (so the first entry should be (0, "GUIDED")). Once the first
+    non-GUIDED mode has been seen the pilot has "flown" the chaser: it is
+    reported `moved` metres (north, east) away from where it started and with a
+    groundspeed of `fly_vn` m/s north, and stays so after GUIDED comes back.
+
+    At every mode change the script OBSERVES it records how many bytes the Orin
+    had written to the FC link (`marks`), so a test can ask exactly what was
+    sent while the pilot had the chaser."""
+
+    def __init__(self, clock, *, schedule, moved=(0.0, 0.0), fly_vn=0.0, **kw):
+        super().__init__(clock, **kw)
+        self.schedule = sorted(schedule)
+        self.moved, self.fly_vn = moved, float(fly_vn)
+        self.hub = None
+        self.marks = []            # (t_rel_s, mode, bytes_written_so_far)
+        self._seen = None
+        self._flown = False
+
+    def attach(self, hub):
+        self.hub = hub
+
+    def chaser(self):
+        snap = super().chaser()
+        t = self.clock.monotonic() - self.t0
+        mode = self.schedule[0][1]
+        for t_s, m in self.schedule:
+            if t >= t_s:
+                mode = m
+        if mode != "GUIDED":
+            self._flown = True
+        if self._flown:
+            snap["lat"], snap["lon"] = chase_offset(HOME_LAT, HOME_LON, *self.moved)
+            snap["vx"] = self.fly_vn
+        snap["mode"] = mode
+        if mode != self._seen:
+            self._seen = mode
+            self.marks.append((round(t, 2), mode,
+                               len(self.hub.conn.written) if self.hub is not None else 0))
+        return snap
+
+
+def chase_offset(lat, lon, n_m, e_m):
+    return (lat + n_m / 111320.0, lon + e_m / (111320.0 * math.cos(math.radians(lat))))
+
+
+def kinds(buf):
+    """The commands in a byte slice of the FC link, reduced to DCS / POS (the
+    rest, e.g. the RTT ping, is not interesting here)."""
+    out = []
+    for m in parse(bytes(buf)):
+        t = m.get_type()
+        if t == "COMMAND_LONG" and m.command == ml2.MAV_CMD_DO_CHANGE_SPEED:
+            out.append("DCS")
+        elif t == "SET_POSITION_TARGET_GLOBAL_INT":
+            out.append("POS")
+    return out
 
 
 def test_orchestrator():
@@ -377,10 +448,11 @@ def test_orchestrator():
               len(lines) > 20 and row["c_yaw"] != "" and row["t_lat"] != "" and row["heading_src"] == "yaw",
               f"rows={len(lines) - 1} yaw={row.get('c_yaw')}")
 
-    code, txt, hub = run_orin(["--set-mode", "--no-log"], budget_s=12.0,
+    code, txt, hub = run_orin(["--set-mode", "--no-log", "--exit-on-pilot"], budget_s=12.0,
                               world_kw=dict(pilot_mode_at=8.0))
-    check("pilot takeover: exits, mode NOT overridden",
-          "Kontrol kumandada" in txt and hub.mode_calls == ["GUIDED"], str(hub.mode_calls))
+    check("--exit-on-pilot (old behaviour): exits, mode NOT overridden",
+          "Kontrol kumandada" in txt and hub.mode_calls == ["GUIDED"] and hub.orch.pauses == 0,
+          str(hub.mode_calls))
 
     code, txt, hub = run_orin(["--set-mode", "--no-log"], budget_s=12.0,
                               world_kw=dict(stop_fix_at=5.0))
@@ -396,6 +468,117 @@ def test_orchestrator():
     code, txt, hub = run_orin(["--set-mode", "--no-log"], answer="hayir")
     check("operator cancels: nothing commanded", code == 0 and "Iptal" in txt
           and hub.mode_calls == [] and not hub.conn.written)
+
+
+def test_pilot_pause_resume():
+    print("7b) pilot pause/resume: LOITER pauses (nothing sent, no exit), GUIDED resumes")
+
+    # --- unit: the speed throttle can be bypassed for the first ticks after a resume
+    conn = FakeConn()
+    env = ChaserEnv(MavHub(conn, chaser_sysid=1, target_sysid=2,
+                           print_statustext=False).chaser_handle(), verbose_speed=False)
+
+    def n_dcs():
+        return len([x for x in conn.sent("COMMAND_LONG")
+                    if x.command == ml2.MAV_CMD_DO_CHANGE_SPEED])
+
+    env.set_guided_horizontal_speed_mps(8.0)
+    env.set_guided_horizontal_speed_mps(8.0)
+    check("throttle: an unchanged speed is not re-sent", n_dcs() == 1, str(n_dcs()))
+    env.force_speed_resend(2)
+    for _ in range(3):
+        env.set_guided_horizontal_speed_mps(8.0)
+    check("force_speed_resend(2): next two go out although unchanged, the third is throttled",
+          n_dcs() == 3, str(n_dcs()))
+
+    # --- the scripted pilot: GUIDED -> LOITER -> GUIDED -> ALT_HOLD -> LOITER -> GUIDED
+    logdir = tempfile.mkdtemp()
+    sched = [(0.0, "GUIDED"), (4.0, "LOITER"), (8.0, "GUIDED"),
+             (11.0, "ALT_HOLD"), (12.0, "LOITER"), (13.0, "GUIDED")]
+    code, txt, hub = run_orin(["--set-mode", "--log-dir", logdir], budget_s=16.0,
+                              world_cls=PilotWorld,
+                              world_kw=dict(schedule=sched, moved=(30.0, 0.0), fly_vn=10.0))
+    w, orch, m = hub.world, hub.orch, hub.world.marks
+    wr = bytes(hub.conn.written)
+
+    def mk(i):  # bytes written when the script first saw mode change #i (-1 if it never did)
+        return m[i][2] if i < len(m) else -1
+    check("the script saw every mode change",
+          [x[1] for x in m] == ["GUIDED", "LOITER", "GUIDED", "ALT_HOLD", "LOITER", "GUIDED"],
+          str([x[1] for x in m]))
+    check("clean run to the operator's Ctrl-C: no exit when the pilot took over",
+          code == 0 and "Traceback" not in txt and "cikiliyor" not in txt and orch.pauses == 2,
+          f"code={code} pauses={orch.pauses}")
+    check("announced: 2x DURAKLATILDI, 2x tekrar GUIDED",
+          txt.count("DURAKLATILDI (komut yok") == 2 and txt.count("tekrar GUIDED") == 2)
+    check("before the pause the chase was running",
+          kinds(wr[:mk(1)]).count("POS") > 20, str(kinds(wr[:mk(1)]).count("POS")))
+    check("pause 1 (LOITER): ZERO bytes sent to the FC", mk(2) >= 0 and mk(2) == mk(1),
+          f"{mk(1)} -> {mk(2)}")
+    check("pause 2 (ALT_HOLD -> LOITER): ZERO bytes sent to the FC", mk(5) >= 0 and mk(5) == mk(3),
+          f"{mk(3)} -> {mk(5)}")
+
+    seq1 = kinds(wr[mk(2):mk(3)]) if mk(2) >= 0 and mk(3) >= 0 else []
+    seq2 = kinds(wr[mk(5):]) if mk(5) >= 0 else []
+    check("resume 1: chase runs again", seq1.count("POS") > 15, str(seq1.count("POS")))
+    check("resume 1: speed re-sent after each of the first position targets",
+          seq1[:6] == ["DCS", "POS", "DCS", "POS", "DCS", "POS"], str(seq1[:8]))
+    check("resume 2: same", seq2.count("POS") > 15 and seq2[:6] == ["DCS", "POS", "DCS", "POS", "DCS", "POS"],
+          str(seq2[:8]))
+
+    dcs1 = [x for x in parse(wr[mk(2):mk(3)] if mk(2) >= 0 and mk(3) >= 0 else b"")
+            if x.get_type() == "COMMAND_LONG" and x.command == ml2.MAV_CMD_DO_CHANGE_SPEED]
+    check("resume 1: speed seeded from the REAL groundspeed (10 m/s), not the stale slew (~3)",
+          bool(dcs1) and 9.5 <= dcs1[0].param2 <= 11.5,
+          f"first DO_CHANGE_SPEED={dcs1[0].param2:.2f}" if dcs1 else "no DO_CHANGE_SPEED after the resume")
+    check("resume: no parameter writes (only the 4 from the start)",
+          len(hub.conn.sent("PARAM_SET")) == 4, str(len(hub.conn.sent("PARAM_SET"))))
+    check("mode never overridden: GUIDED at start, LOITER only as the Ctrl-C hand-back",
+          hub.mode_calls == ["GUIDED", "LOITER"], str(hub.mode_calls))
+
+    sent, holds = orch._totals()
+    n_pos = len(hub.conn.sent("SET_POSITION_TARGET_GLOBAL_INT"))
+    check("counters add up across the fresh controllers", sent + holds == n_pos
+          and orch._sent_prev > 0 and orch.ctl.sent < sent, f"sent={sent} holds={holds} pos={n_pos}")
+    check("paused time counted (4 s + 2 s)", 5.6 <= orch.paused_total_s <= 6.6,
+          f"{orch.paused_total_s:.2f}")
+
+    st = [f for f in os.listdir(logdir) if f.startswith("chase_state_")]
+    if st:
+        lines = [r for r in open(os.path.join(logdir, st[0])).read().splitlines()
+                 if r and not r.startswith("#")]
+        hdr = lines[0].split(",")
+        rows = [dict(zip(hdr, r.split(","))) for r in lines[1:]]
+        paused = [r for r in rows if r["phase"] == "paused"]
+        chase = [r for r in rows if r["phase"] == "track_plan"]
+        check("state CSV keeps logging while paused (phase=paused, why=PILOT <mode>)",
+              50 <= len(paused) <= 70 and all(r["why"].startswith("PILOT ") for r in paused)
+              and 85 <= len(chase) <= 110, f"paused={len(paused)} chase={len(chase)}")
+        check("  ...with the pilot-flown state (moved 30 m north, 10 m/s)",
+              bool(paused) and abs(float(paused[0]["c_vx"]) - 10.0) < 1e-6
+              and float(paused[0]["c_lat"]) > HOME_LAT + 29.0 / 111320.0,
+              f"c_vx={paused[0]['c_vx']} c_lat={paused[0]['c_lat']}" if paused else "no paused rows")
+    else:
+        check("state CSV written", False, str(os.listdir(logdir)))
+
+    # --- Ctrl-C while the pilot still has it: their mode is left alone
+    code, txt, hub = run_orin(["--set-mode", "--no-log"], budget_s=9.0, world_cls=PilotWorld,
+                              world_kw=dict(schedule=[(0.0, "GUIDED"), (4.0, "LOITER")]))
+    m = hub.world.marks
+    check("Ctrl-C while paused: no LOITER sent, pilot's mode left alone",
+          hub.mode_calls == ["GUIDED"] and "Kontrol pilotta (mod=LOITER)" in txt,
+          str(hub.mode_calls))
+    check("  ...and nothing was written after the pause began",
+          len(m) >= 2 and len(hub.conn.written) == m[1][2],
+          f"{m[1][2] if len(m) >= 2 else '?'} vs {len(hub.conn.written)}")
+    check("  ...paused time counted at exit", hub.orch.paused and 4.5 <= hub.orch.paused_total_s <= 5.6,
+          f"{hub.orch.paused_total_s:.2f}")
+
+    # --- dry-run never commands, so it never pauses
+    code, txt, hub = run_orin(["--dry-run", "--no-log"], budget_s=8.0, world_cls=PilotWorld,
+                              world_kw=dict(schedule=[(0.0, "GUIDED"), (3.0, "LOITER")]))
+    check("dry-run: never pauses, nothing sent", hub.orch.pauses == 0
+          and "DURAKLATILDI" not in txt and not hub.conn.written)
 
 
 # ---------------------------------------------------------------- 8 live UDP
@@ -580,6 +763,7 @@ def main():
     test_relay()
     test_round_trip()
     test_orchestrator()
+    test_pilot_pause_resume()
     test_udp_loopback()
     test_relay_main()
     print("-" * 68)

@@ -71,9 +71,12 @@ from chase_core import (
     add_planner_args,
     build_traj_config,
     chaser_home_amsl,
+    format_altitude,
     has_fix,
     haversine_m,
     print_plan_banner,
+    print_initial_separation,
+    validate_altitude_options,
     warn_offset_vs_minsep,
 )
 from chaser_env import ChaserEnv
@@ -359,6 +362,10 @@ def main():
     ap.add_argument("--set-mode", action="store_true", help="modu script degistirsin (GUIDED)")
     ap.add_argument("--dry-run", action="store_true", help="FC'ye komut gonderme")
     a = ap.parse_args()
+    try:
+        validate_altitude_options(a.alt_ref, a.sep_bias, a.alt_offset)
+    except ValueError as e:
+        ap.error(str(e))
 
     if a.rec_stop >= a.rec_start:
         sys.exit("[X] --rec-stop, --rec-start'tan kucuk olmali.")
@@ -373,6 +380,8 @@ def main():
             "deadline_range_m": a.deadline_range,
             "close_approach_mps": a.close_approach,
             "alt_offset_m": a.alt_offset,
+            "alt_ref": a.alt_ref,
+            "sep_bias_m": a.sep_bias,
             "alt_match": int(a.alt_match),
             "posvel": int(a.posvel),
             "stream_hz": a.stream_hz,
@@ -415,19 +424,18 @@ def main():
     if ts["lat"] is None or cs["lat"] is None:
         sys.exit("[X] Iki drone'dan da konum gelmedi.")
 
-    print(f"  HEDEF  : {ts['lat']:.7f}, {ts['lon']:.7f}  amsl={ts['alt_amsl']:.1f} "
-          f"rel={ts['alt_rel']:.1f}  fix={ts['fix']}/{ts['nsat']}  mod={ts['mode']}  "
+    print(f"  HEDEF  : {ts['lat']:.7f}, {ts['lon']:.7f}  amsl={format_altitude(ts.get('alt_amsl'))} "
+          f"rel={format_altitude(ts.get('alt_rel'))}  fix={ts['fix']}/{ts['nsat']}  mod={ts['mode']}  "
           f"gelen={ts['hz']:.1f} Hz")
-    print(f"  TAKIPCI: {cs['lat']:.7f}, {cs['lon']:.7f}  amsl={cs['alt_amsl']:.1f} "
-          f"rel={cs['alt_rel']:.1f}  fix={cs['fix']}/{cs['nsat']}  mod={cs['mode']}  "
+    print(f"  TAKIPCI: {cs['lat']:.7f}, {cs['lon']:.7f}  amsl={format_altitude(cs.get('alt_amsl'))} "
+          f"rel={format_altitude(cs.get('alt_rel'))}  fix={cs['fix']}/{cs['nsat']}  mod={cs['mode']}  "
           f"gelen={cs['hz']:.1f} Hz")
     print(f"  [i] istenen {a.stream_hz:.0f} Hz - 'gelen' bunun cok altindaysa "
           f"telemetri linki doymus demektir")
     if has_fix(ts) and has_fix(cs):
         print(f"  aralarindaki mesafe: "
               f"{haversine_m(cs['lat'], cs['lon'], ts['lat'], ts['lon']):.0f} m")
-        print(f"  olculen dikey ayrim: {ts['alt_amsl'] - cs['alt_amsl']:+.1f} m "
-              f"(+ = takipci altta)")
+        print_initial_separation(a, ts, cs)
     else:
         for tag, st in (("HEDEF", ts), ("TAKIPCI", cs)):
             if not has_fix(st):
@@ -441,7 +449,7 @@ def main():
     chaser_env = ChaserEnv(chaser, verbose_speed=False, cmd_latency=link_log.cmd_lat)
     chaser_env.enable_posvel(a.posvel)
     ctl = TrackController(
-        cfg, chaser_env, alt_offset=a.alt_offset, sep_bias=a.sep_bias,
+        cfg, chaser_env, alt_offset=a.alt_offset, sep_bias=a.sep_bias, alt_ref=a.alt_ref,
         min_alt=a.min_alt, min_sep=a.min_sep, max_dist=a.max_dist,
         max_age=a.max_age, posvel=a.posvel, dry_run=a.dry_run,
         cmd_lat=link_log.cmd_lat,

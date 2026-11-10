@@ -64,6 +64,8 @@ class ChaserEnv:
         # DO_CHANGE_SPEED throttle state (see set_guided_horizontal_speed_mps)
         self._wp_spd_mps = -1.0
         self._wp_spd_cmd_t = 0.0
+        # >0: the next N speed commands bypass the throttle (see force_speed_resend)
+        self._force_speed_n = 0
         # live global position, refreshed each tick from the Vehicle snapshot
         self._mavlink_global_valid = False
         self._mavlink_lat_deg = 0.0
@@ -209,6 +211,20 @@ class ChaserEnv:
             0.0,
         )
 
+    def force_speed_resend(self, n: int = 3) -> None:
+        """Send the next `n` DO_CHANGE_SPEED commands regardless of the throttle.
+
+        Needed when GUIDED is RE-ENTERED after the pilot flew (chase_orin's
+        pause/resume): ArduCopter re-reads WP_SPD (= the raised ceiling) into the
+        active speed when the first GUIDED position target after (re)entry
+        starts, so our remembered "last speed sent" is no longer what the FC is
+        using. With the throttle alone, a steady commanded speed would never be
+        re-sent and the chaser would fly at the ceiling instead of the planner's
+        speed. The planner sends speed BEFORE position within a tick, so the
+        first command can land before the FC resets; a few repeats make sure one
+        arrives after it."""
+        self._force_speed_n = max(0, int(n))
+
     def set_guided_horizontal_speed_mps(
         self,
         speed_mps: float,
@@ -225,10 +241,13 @@ class ChaserEnv:
         last_t = float(self._wp_spd_cmd_t)
         min_dt = max(0.0, float(min_interval_s))
         min_dv = max(0.05, float(min_delta_mps))
-        if prev >= 0.0 and abs(spd - prev) < min_dv:
-            return
-        if prev >= 0.0 and min_dt > 0.0 and (now - last_t) < min_dt:
-            return
+        if self._force_speed_n > 0:
+            self._force_speed_n -= 1   # forced: skip both throttles below
+        else:
+            if prev >= 0.0 and abs(spd - prev) < min_dv:
+                return
+            if prev >= 0.0 and min_dt > 0.0 and (now - last_t) < min_dt:
+                return
         self._wp_spd_mps = spd
         self._wp_spd_cmd_t = now
         # SPEED_TYPE_GROUNDSPEED = 1

@@ -74,3 +74,7 @@ Thumbs.db
 # scripts/build_yolo_engine.sh). ORTrack .pth.tar (102 MB) GitHub'a giremez -> tek kaynak ONNX.
 # (orin-tiled-tracker'da ONNX yok: engine .pt'den uretilir)
 !hunter-orin/models/*.onnx
+
+# 10 Kas: avci_follow yedek arsivleri ve tarihli snapshotlar
+*.tar.xz
+avci_follow_[0-9]*/

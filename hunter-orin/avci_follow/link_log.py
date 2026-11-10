@@ -53,7 +53,7 @@ _RELAY_HEADER = (
 # to the chaser's groundspeed first moving toward the new target (INCLUDES FC +
 # physical acceleration, not pure transport).
 _CMDLAT_HEADER = "t_wall_iso,t_mono,event,command,latency_ms,detail"
-_CMD_NAMES = {178: "DO_CHANGE_SPEED", 512: "REQUEST_MESSAGE"}
+_CMD_NAMES = {178: "DO_CHANGE_SPEED", 512: "REQUEST_MESSAGE", 111: "TIMESYNC"}
 
 
 class _CsvFile:
@@ -283,6 +283,26 @@ class CmdLatencyTracker:
                 self._row(t_mono, "rtt", cmd, dt * 1000.0, "")
                 self.rtt_count += 1
                 self._recent_ms = (self._recent_ms + [dt * 1000.0])[-20:]
+            self._maybe_flush(t_mono)
+
+    def note_rtt(self, command: int, latency_ms: float, t_mono: float) -> None:
+        """Log an RTT measured by the caller (e.g. a TIMESYNC round trip on
+        relay_radio, timed from its own echoed stamp). Any thread."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._row(t_mono, "rtt", command, float(latency_ms), "")
+            self.rtt_count += 1
+            self._recent_ms = (self._recent_ms + [float(latency_ms)])[-20:]
+            self._maybe_flush(t_mono)
+
+    def note_lost(self, command: int, t_mono: float, detail: str = "") -> None:
+        """Log a probe that never got its reply. Any thread."""
+        if not self.enabled:
+            return
+        with self._lock:
+            self._row(t_mono, "rtt_lost", command, None, detail)
+            self.lost_count += 1
             self._maybe_flush(t_mono)
 
     def summary(self):

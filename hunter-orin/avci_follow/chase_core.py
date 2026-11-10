@@ -68,9 +68,44 @@ def chaser_home_amsl(s) -> Optional[float]:
     """Chaser home AMSL = alt_amsl - alt_rel. Constant through a flight even
     as the baro drifts (both fields drift together), so it is the stable
     reference for cross-vehicle altitude math."""
-    if s.get("alt_amsl") is None or s.get("alt_rel") is None:
+    if not (valid_altitude(s.get("alt_amsl")) and valid_altitude(s.get("alt_rel"))):
         return None
     return float(s["alt_amsl"]) - float(s["alt_rel"])
+
+
+def valid_altitude(value) -> bool:
+    return value is not None and math.isfinite(value)
+
+
+def format_altitude(value) -> str:
+    return f"{value:.1f}" if valid_altitude(value) else "?"
+
+
+def validate_altitude_options(alt_ref, sep_bias, alt_offset):
+    if alt_ref not in ("same-home", "amsl"):
+        raise ValueError("--alt-ref: same-home veya amsl secilmeli.")
+    if not (valid_altitude(sep_bias) and valid_altitude(alt_offset)):
+        raise ValueError("--alt-offset ve --sep-bias sonlu sayilar olmali.")
+    if alt_ref == "same-home" and sep_bias != 0:
+        raise ValueError("--alt-ref same-home ile --sep-bias kullanilmaz. Eski AMSL duzeltmesini kaldirin.")
+
+
+def target_height_above_chaser_home(ts, chome, alt_ref, sep_bias):
+    """Measured target altitude before the operator's flight offset, in metres."""
+    if alt_ref == "same-home":
+        rel = ts.get("alt_rel")
+        return rel if valid_altitude(rel) else None
+    amsl = ts.get("alt_amsl")
+    if not (valid_altitude(amsl) and valid_altitude(chome)):
+        return None
+    return amsl - sep_bias - chome
+
+
+def print_initial_separation(a, ts, cs):
+    height = target_height_above_chaser_home(ts, chaser_home_amsl(cs), a.alt_ref, a.sep_bias)
+    if height is not None and valid_altitude(cs.get("alt_rel")):
+        print(f"  olculen dikey ayrim ({a.alt_ref}): {height - cs['alt_rel']:+.1f} m "
+              "(+ = takipci altta)")
 
 
 # ---------------------------------------------------------------- shared CLI
@@ -96,6 +131,9 @@ def add_planner_args(ap) -> None:
                     help="intercept zaman marji (s)")
 
     # --- altitude ---
+    ap.add_argument("--alt-ref", choices=("amsl", "same-home"), default="amsl",
+                    help="amsl: mevcut AMSL hesabi. same-home: kalkis noktalari ayni "
+                         "kottaysa hedefin relative_alt degerini kullan.")
     ap.add_argument("--alt-offset", type=float, default=-3.0,
                     help="hedefin irtifasina gore ofset (m). POZITIF = ustunde, "
                          "NEGATIF = altinda. Her tik yeniden hesaplanir (latch yok). "
@@ -107,7 +145,7 @@ def add_planner_args(ap) -> None:
                     help="temiz modu KAPAT; dosyanin orijinal balon temizlik/tavan "
                          "mantigina don (alcak hedefin ustunden gec, 50 m'de sinirla).")
     ap.add_argument("--sep-bias", type=float, default=0.0,
-                    help="iki drone GERCEKTEN ayni seviyedeyken okunan dikey ayrim. "
+                    help="Yalniz amsl modunda: iki drone ayni seviyedeyken okunan ham dikey ayrim. "
                          "Once --dry-run ile olc, buraya gir.")
     ap.add_argument("--min-alt", type=float, default=10.0,
                     help="komut irtifasi alt siniri (m, chaser home ustu)")
@@ -161,7 +199,7 @@ def print_plan_banner(a) -> None:
           f"caprazda ARKADAN takip eder (follow) - kisitsiz.")
     print(f"  hiz    : uzakta {a.max_speed:.0f} m/s, {a.deadline_range:.0f} m icinde "
           f"{a.close_approach:.0f} m/s'e iner (adaptif). WP_ACC={a.accel:.0f}.")
-    print(f"  irtifa : hedefin {abs(a.alt_offset):.0f} m {where}"
+    print(f"  irtifa : referans={a.alt_ref}, hedefin {abs(a.alt_offset):.0f} m {where}"
           + (" (alt-match: dogrudan)" if a.alt_match else " (dosya temizlik/tavan mantigi)")
           + f"; alt sinir {a.min_alt:.0f} m")
     print(f"  komut  : {'pozisyon + hedef hizi (posvel)' if a.posvel else 'pozisyon + yaw'}")
@@ -195,6 +233,9 @@ class Tick:
     allow_visual_lock: Optional[bool] = None
     realign_phase: str = "-"
     heading_src: str = "-"             # "yaw" (sim-faithful) or "course" (fallback)
+    alt_ref: str = "amsl"
+    alt_offset_m: Optional[float] = None
+    sep_bias_m: Optional[float] = None
 
 
 class _NullCmdLat:
@@ -216,11 +257,14 @@ class TrackController:
 
     def __init__(self, cfg: TrajectoryConfig, env, *, alt_offset: float, sep_bias: float,
                  min_alt: float, min_sep: float, max_dist: float, max_age: float,
-                 posvel: bool, dry_run: bool, cmd_lat=None, att_max_age_s: float = 1.0):
+                 posvel: bool, dry_run: bool, cmd_lat=None, att_max_age_s: float = 1.0,
+                 alt_ref: str = "amsl"):
         self.cfg = cfg
         self.env = env
         self.alt_offset = float(alt_offset)
         self.sep_bias = float(sep_bias)
+        self.alt_ref = alt_ref
+        validate_altitude_options(self.alt_ref, self.sep_bias, self.alt_offset)
         self.min_alt = float(min_alt)
         self.min_sep = float(min_sep or 0.0)
         self.max_dist = float(max_dist)
@@ -253,9 +297,10 @@ class TrackController:
                                           last_ang_y=last_ang_y)
 
     # ------------------------------------------------ helpers
-    def gate_alt(self, ts, chome: float) -> float:
+    def gate_alt(self, ts, chome: Optional[float]) -> Optional[float]:
         """Target altitude in the chaser-home frame, plus the operator offset."""
-        return (float(ts["alt_amsl"]) - self.sep_bias - chome) + self.alt_offset
+        height = target_height_above_chaser_home(ts, chome, self.alt_ref, self.sep_bias)
+        return None if height is None else height + self.alt_offset
 
     def drone_state(self, cs, now: float):
         c_ned = latlonalt_to_local(cs["lat"], cs["lon"], cs["alt_rel"],
@@ -279,7 +324,7 @@ class TrackController:
 
     def _hold(self, cs) -> bool:
         """Sim --stale-hold: position target at the chaser's current position."""
-        if self.dry_run or not has_fix(cs) or cs.get("alt_rel") is None:
+        if self.dry_run or not has_fix(cs) or not valid_altitude(cs.get("alt_rel")):
             return False
         self.env.refresh_from_snapshot(cs)
         if self.posvel:
@@ -292,7 +337,7 @@ class TrackController:
 
     # ------------------------------------------------ one control tick
     def tick(self, ts, cs, now: float) -> Tick:
-        k = Tick()
+        k = Tick(alt_ref=self.alt_ref, alt_offset_m=self.alt_offset, sep_bias_m=self.sep_bias)
 
         # --- gates: chaser first (a hold needs its own position) ---
         if cs.get("lat") is None:
@@ -301,18 +346,21 @@ class TrackController:
         if not has_fix(cs):
             k.why = f"TAKIPCI GPS yok (fix={cs.get('fix')}, sat={cs.get('nsat')})"
             return k  # cannot hold without our own GPS; FC failsafes handle this
-        chome = chaser_home_amsl(cs)
+        target_height = target_height_above_chaser_home(
+            ts, chaser_home_amsl(cs), self.alt_ref, self.sep_bias)
         if ts.get("lat") is None:
             k.why = "hedef konumu henuz gelmedi"
         elif not has_fix(ts):
             k.why = f"HEDEF GPS yok (fix={ts.get('fix')}, sat={ts.get('nsat')})"
         elif ts["age"] > self.max_age:
             k.why = f"hedef konumu {ts['age']:.1f} s bayat"
-        elif chome is None:
-            k.why = "takipci home AMSL cozulemedi"
+        elif not valid_altitude(cs.get("alt_rel")):
+            k.why = "takipci relative_alt gecersiz"
+        elif target_height is None:
+            k.why = f"irtifa verisi eksik veya gecersiz ({self.alt_ref})"
         else:
             k.d = haversine_m(cs["lat"], cs["lon"], ts["lat"], ts["lon"])
-            k.sep = (float(ts["alt_amsl"]) - float(cs["alt_amsl"])) - self.sep_bias
+            k.sep = target_height - cs["alt_rel"]
             if k.d > self.max_dist:
                 k.why = f"mesafe {k.d:.0f} m > kelepce {self.max_dist:.0f} m"
             elif self.min_sep > 0 and abs(k.sep) < self.min_sep:
@@ -323,6 +371,7 @@ class TrackController:
             return k
 
         # --- own state in the fixed chaser-home NED frame ---
+        gate_alt = target_height + self.alt_offset
         drone, k.heading_src = self.drone_state(cs, now)
 
         # --- feed the KF only on a genuinely new target fix (exact stamp) ---
@@ -336,7 +385,7 @@ class TrackController:
                 timestamp_s=now,  # sim: gate_sample_to_radar(gate, timestamp_s=now)
                 latitude_deg=float(ts["lat"]),
                 longitude_deg=float(ts["lon"]),
-                altitude_up_m=float(self.gate_alt(ts, chome)),
+                altitude_up_m=gate_alt,
                 ground_speed_mps=spd if spd > 0.05 else None,
                 course_rad=(math.atan2(ts["vy"], ts["vx"]) if spd > 0.05 else None),
             )
@@ -347,7 +396,6 @@ class TrackController:
 
         # --- gate sample every tick; min-alt floor ---
         out = self.last_out
-        gate_alt = self.gate_alt(ts, chome)
         rng = out.distance_to_target_m if out is not None else None
         preview = traj_hold_alt_m(gate_alt, self.cfg, range_m=rng)
         if preview < self.min_alt:
@@ -402,7 +450,8 @@ _STATE_HEADER = (
     "t_wall,t_mono,phase,why,held,updated,behavior,follow_phase,allow_lock,realign,"
     "v_cmd,cmd_alt,range_m,d_m,sep_m,heading_src,"
     "c_lat,c_lon,c_alt_rel,c_alt_amsl,c_vx,c_vy,c_vz,c_roll,c_pitch,c_yaw,c_att_age,c_hz,"
-    "t_lat,t_lon,t_alt_amsl,t_vx,t_vy,t_vz,t_age,t_hz,compute_ms,send_ms"
+    "t_lat,t_lon,t_alt_amsl,t_vx,t_vy,t_vz,t_age,t_hz,compute_ms,send_ms,"
+    "t_alt_rel,alt_ref,alt_offset_m,sep_bias_m"
 )
 
 
@@ -443,6 +492,7 @@ class StateLog:
             f(ts.get("vx"), 2), f(ts.get("vy"), 2), f(ts.get("vz"), 2),
             f(ts.get("age"), 3), f(ts.get("hz"), 2),
             f(k.compute_ms, 3), f(k.send_ms, 3),
+            f(ts.get("alt_rel"), 3), k.alt_ref, k.alt_offset_m, k.sep_bias_m,
         ])
         if t_mono - self._last_flush > 2.0:
             self._last_flush = t_mono

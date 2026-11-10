@@ -288,6 +288,133 @@ def test_cmd_latency():
     check("rtt latency ~120 ms", abs(lat - 120.0) < 1.0, f"got {lat}")
 
 
+def test_link_log_routing():
+    print("6) link_log: padded vehicle names land in the right CSV (bug fix)")
+    import os
+    import tempfile
+    from link_log import LinkLogger
+
+    d = tempfile.mkdtemp()
+    lg = LinkLogger(d, meta={"t": "x"}, enabled=True, with_relay=False, with_cmd=False)
+
+    class Msg:
+        def __init__(self, typ, src):
+            self._t, self._s = typ, src
+
+        def get_type(self):
+            return self._t
+
+        def get_srcSystem(self):
+            return self._s
+
+    lg.note_message("HEDEF  ", Msg("GLOBAL_POSITION_INT", 2), 10.0)   # padded, as follow_gps names it
+    lg.note_message("TAKIPCI", Msg("GLOBAL_POSITION_INT", 1), 10.0)
+    lg.close()
+    files = sorted(os.listdir(d))
+    check("no relay/cmd CSVs when disabled", not any(f.startswith(("relay_lat", "cmd_lat"))
+                                                     for f in files), str(files))
+
+    def rows(prefix):
+        f = next(x for x in files if x.startswith(prefix))
+        return [r for r in open(os.path.join(d, f)).read().splitlines()
+                if r and not r.startswith("#") and not r.startswith("t_wall")]
+
+    check("'HEDEF  ' -> hedef_link CSV", len(rows("hedef_link")) == 1, str(rows("hedef_link")))
+    check("'TAKIPCI' -> chaser_link CSV", len(rows("chaser_link")) == 1, str(rows("chaser_link")))
+
+
+def test_param_wait_no_link_read():
+    print("7) ChaserEnv param read-back goes through the RX-thread waiter (bug fix)")
+
+    class StrictMav(FakeMav):
+        def recv_match(self, **kw):
+            raise AssertionError("ChaserEnv must not read the link while an RX thread owns it")
+
+    class WaiterVehicle:
+        def __init__(self):
+            self.conn = StrictMav()
+            self.asked = []
+
+        def wait_param(self, name, *, since_mono, timeout):
+            self.asked.append(name)
+            return 20.0
+
+    veh = WaiterVehicle()
+    env = ChaserEnv(veh, verbose_param=False)
+    got = env._get_param("WP_SPD")
+    check("value comes from wait_param", got == 20.0 and veh.asked == ["WP_SPD"],
+          f"got={got} asked={veh.asked}")
+    ok = env._set_param("WP_ACC", 20.0, wait=True)
+    check("set-with-verify also uses the waiter", ok and veh.asked[-1] == "WP_ACC")
+
+
+def test_heading_source():
+    print("8) drone heading = ATTITUDE yaw (sim-faithful), course only as fallback")
+    from chase_core import TrackController
+
+    cfg = cfg_default()
+    ctl = TrackController(cfg, ChaserEnv(FakeVehicle()), alt_offset=0, sep_bias=0, min_alt=10,
+                          min_sep=0, max_dist=1000, max_age=3, posvel=False, dry_run=True)
+    hover = dict(lat=HOME_LAT, lon=HOME_LON, alt_rel=40.0, alt_amsl=940.0,
+                 vx=0.02, vy=-0.03, vz=0.0, yaw=math.radians(90), att_age=0.2)
+    drone, src = ctl.drone_state(hover, now=1.0)
+    check("hovering: heading = yaw (90°)", src == "yaw" and abs(drone.heading_rad - math.pi / 2) < 1e-9,
+          f"src={src} hdg={math.degrees(drone.heading_rad):.1f}°")
+    stale_att = dict(hover, att_age=5.0)
+    _d, src2 = ctl.drone_state(stale_att, now=1.0)
+    check("stale/no attitude: falls back to course", src2 == "course", f"src={src2}")
+
+
+def test_altitude_reference():
+    from chase_core import TrackController
+
+    # 25 Oct: both vehicles at about 100 m above their own home, with
+    # different absolute references. Check the actual outgoing MAVLink field.
+    chaser = dict(lat=HOME_LAT, lon=HOME_LON, alt_rel=100.07, alt_amsl=1061.98,
+                  vx=0.0, vy=0.0, vz=0.0, yaw=0.0, att_age=0.0, fix=3, age=0.0)
+    target = dict(chaser, lat=HOME_LAT + 0.001, alt_rel=100.288, alt_amsl=1093.58)
+
+    def controller(**options):
+        settings = dict(alt_offset=0.0, sep_bias=0.0, min_alt=10.0, min_sep=0.0,
+                        max_dist=1000.0, max_age=3.0, posvel=False, dry_run=False)
+        settings.update(options)
+        vehicle = FakeVehicle()
+        ctl = TrackController(cfg_default(traj_alt_match_above_m=-1e9),
+                              ChaserEnv(vehicle), **settings)
+        return ctl, vehicle.conn.pos_int
+
+    for options, expected in (({}, 131.67), ({"sep_bias": 32.0}, 99.67),
+                              ({"alt_ref": "same-home", "alt_offset": 10.0}, 110.288)):
+        ctl, sent = controller(**options)
+        k = ctl.tick(target, chaser, 1.0)
+        check(f"logged and transmitted altitude {expected}",
+              not k.why and abs(k.cmd_alt - expected) < 1e-6
+              and len(sent) == 1 and abs(sent[0][7] - expected) < 1e-6)
+
+    ctl, sent = controller(alt_ref="same-home", alt_offset=10, min_sep=5)
+    k = ctl.tick(target, chaser, 1.0)
+    check("min-sep uses measured relative heights, excluding offset",
+          k.held and abs(k.sep - 0.218) < 1e-6 and sent[-1][7] == chaser["alt_rel"])
+
+    ctl, sent = controller(alt_ref="same-home", alt_offset=-2)
+    k = ctl.tick(dict(target, alt_rel=0, alt_amsl=None), dict(chaser, alt_amsl=None), 1.0)
+    check("zero relative altitude is valid; min-alt floor applies", not k.why and sent[-1][7] == 10)
+    for invalid in (None, float("nan"), float("inf")):
+        k = ctl.tick(dict(target, alt_rel=invalid), chaser, 2.0)
+        check("invalid target relative altitude holds without switching reference",
+              k.held and k.cmd_alt is None and sent[-1][7] == chaser["alt_rel"])
+    n_sent = len(sent)
+    k = ctl.tick(target, dict(chaser, alt_rel=float("nan")), 3.0)
+    check("invalid own relative altitude cannot generate a setpoint",
+          k.why and not k.held and len(sent) == n_sent)
+    try:
+        controller(alt_ref="same-home", sep_bias=32.0)
+    except ValueError:
+        check("old bias cannot be applied in same-home", True)
+    else:
+        check("old bias cannot be applied in same-home", False)
+
+
 def main():
     print("=" * 68)
     print("follow_gps wiring/integration test (no hardware)")
@@ -297,6 +424,10 @@ def main():
     test_altitude_math()
     test_end_to_end_intercept()
     test_cmd_latency()
+    test_link_log_routing()
+    test_param_wait_no_link_read()
+    test_heading_source()
+    test_altitude_reference()
     print("-" * 68)
     print(f"PASS={PASS}  FAIL={FAIL}")
     print("-" * 68)

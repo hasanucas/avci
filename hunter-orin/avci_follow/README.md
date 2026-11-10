@@ -8,9 +8,10 @@ gelirsen **önünü keser** (intercept), çaprazda **arkadan takip eder** (follo
 | | Beyin nerede | Komut yolu | Script(ler) |
 |---|---|---|---|
 | **Laptop** | laptop | laptop → takipçi radyosu | `follow_gps.py` |
-| **Orin (Aşama 1)** | takipçinin Orin'i | Orin → USB (radyo yok) | laptop: `relay_target.py`, Orin: `chase_orin.py` |
+| **Orin + radyo (SAHA, 24 Ekim)** | takipçinin Orin'i | Orin → USB; 3DR Orin USB'sinde, sadece hedef verisi | Victus: `relay_radio.py`, Orin: `chase_orin.py --target-link ...` |
+| Orin, eski (radyo FC'de) | takipçinin Orin'i | Orin → USB | laptop: `relay_target.py`, Orin: `chase_orin.py` |
 
-Orin şekli aşağıda kendi bölümünde ("Orin mimarisi"). Bu giriş laptop şeklini anlatır:
+Orin şekilleri aşağıda kendi bölümlerinde ("Orin + radyo düzeni", "Orin mimarisi"). Bu giriş laptop şeklini anlatır:
 bütün komutlar laptopta iki telemetri radyosundan hesaplanıp takipçiye MAVLink GUIDED ile
 gönderilir.
 
@@ -40,9 +41,10 @@ FOLLOW'a düşer.
 ```
 chase_core.py       ORTAK BEYIN: TRACK_PLAN tiki (geçitler, yerinde-tut, KF, carrot) + ortak bayraklar
 follow_gps.py       laptop şekli (iki radyo + ortak beyin)
-relay_target.py     Orin şekli, LAPTOP tarafı: hedef paketlerini takipçi radyosuna aktarır (uçuş komutu yok; RTT ping'i)
-chase_orin.py       Orin şekli, ORIN tarafı: beyin + faz makinesi (TRACK_PLAN; VISUAL/REALIGN kapalı)
-mav_hub.py          Orin: tek linkte iki araç (sysid ile ayırma, komutları takipçiye sabitleme)
+relay_radio.py      Orin+radyo, VICTUS tarafı: hedef kaynağı (UDP/COM) -> 3DR; pasif; radyo RTT; takipçi durumu
+relay_target.py     Orin eski şekil, LAPTOP tarafı: hedef paketlerini takipçi radyosuna aktarır (uçuş komutu yok; RTT ping'i)
+chase_orin.py       Orin şekli, ORIN tarafı: beyin + faz makinesi (TRACK_PLAN; VISUAL/REALIGN kapalı); --target-link = radyo modu
+mav_hub.py          Orin: radyo modunda hedef radyodan / takipçi FC'den (ayrı linkler); eski modda tek linkte sysid ile ayırma
 chaser_env.py       pymavlink adaptörü (planlayıcı → gerçek drone)
 link_log.py         telemetri/gecikme loglama
 fpv_gate_il/        vendorlanan yörünge paketi (birebir; sadece mav_bridge'de Gazebo import'u nötr)
@@ -50,6 +52,8 @@ test_offline.py     planlayıcı mantığı regresyonu
 test_wiring.py      montaj/adaptör entegrasyon testi
 test_loop.py        follow_gps ANA DÖNGÜSÜ uçtan uca (sahte araçlar, sanal saat)
 test_orin.py        Orin şekli: hub, sabitleme, relay, uçtan uca aktarım, canlı UDP, orkestratör
+test_radio.py       Orin+radyo: link ayrımı, TIMESYNC, aşağı link, olaylar, yeniden bağlanma, relay_radio,
+                    sinyaller, canlı uçtan uca (sahte Talon -> relay -> sanal 3DR çifti -> hub <-> sahte FC)
 ```
 Hepsi donanımsız çalışır; Python 3.10 (Orin JetPack 6) ve numpy 1.21/2.x ile doğrulandı.
 
@@ -59,20 +63,21 @@ pip install pymavlink pyserial numpy
 ```
 
 ## ZORUNLU iş akışı (sırasıyla)
-1. **Önce offline testler** — her saha çıkışından önce (dördü de `FAIL=0` vermeli):
+1. **Önce offline testler** — her saha çıkışından önce (beşi de `FAIL=0` vermeli;
+   `test_radio.py` sanal seri port kullandığı için Linux'ta/Orin'de koşar):
    ```
-   python test_offline.py && python test_wiring.py && python test_loop.py && python test_orin.py
+   python test_offline.py && python test_wiring.py && python test_loop.py && python test_orin.py && python test_radio.py
    ```
-2. **Dry-run + dikey ayrım okuması** (FC'ye komut YOK):
+2. **Aynı kottan kalkış için yerde kontrol.** İki araç da aynı zemindeyken:
    ```
-   python follow_gps.py --target-port COM12 --chaser-port COM5 --dry-run --no-rec
+   python follow_gps.py --target-port COM12 --chaser-port COM5 --alt-ref same-home --dry-run --no-rec
    ```
-   İki drone'u **gerçekten aynı irtifaya** getir, ekrandaki `olculen dikey ayrim`
-   değerini oku. Sıfır okumuyorsa o değeri bir sonraki adımda `--sep-bias` ile ver.
+   Her iki aracın home referansı oluştuktan sonra `olculen dikey ayrim (same-home)` sıfıra yakın olmalı.
+   Beklenmeyen fark varsa iki aracın `rel` değerlerini ve home noktalarını kontrol et.
 3. **Saha çalışması.** Varsayılanlar zaten filmcilik için ayarlı (temiz irtifa modu açık,
    3 m altta, ~200 m'ye kadar tam 20 m/s, 100 m içinde 10 m/s):
    ```
-   python follow_gps.py --target-port COM12 --chaser-port COM5 --sep-bias <olculen> --set-mode
+   python follow_gps.py --target-port COM12 --chaser-port COM5 --alt-ref same-home --set-mode
    ```
    Farklı bir dikey mesafe istersen sadece offset'i değiştir (ör. 5 m altta: --alt-offset -5).
 
@@ -99,12 +104,20 @@ Kısa menzilde test edersen 10 m/s görürsün — bu **doğru**. Kırılma mesa
 `--deadline-range` / `--decel-start-range` ile istediğin gibi ayarla.
 
 ## İrtifa
-Gönderilen irtifa her tikte hedefin canlı irtifasından **yeniden** hesaplanır (latch yok):
-```
-gate_alt = (hedef_amsl - sep_bias - takipci_home_amsl) + alt_offset
-```
-`takipci_home_amsl = alt_amsl - alt_rel` — baro sürüklense bile uçuş boyunca sabittir
-(iki alan birlikte sürüklenir), bu yüzden çapraz-araç irtifa matematiğinin dayanağı odur.
+Orin ve laptop aynı `--alt-ref` seçeneğini kullanır. Çıkış her zaman takipçinin home kotundan yukarı metre cinsindendir.
+
+| Referans | Hedefin takipçi home'una göre yüksekliği | Kullanım |
+|---|---|---|
+| `--alt-ref same-home` | Talon `GLOBAL_POSITION_INT.relative_alt` (m'ye çevrilir) | İki aracın home noktaları aynı fiziksel kottaysa. `--sep-bias` sıfır olmalı. |
+| `--alt-ref amsl` (varsayılan) | Hedef AMSL − `sep_bias` − takipçi home AMSL | Önceki sürümün hesabı. Mutlak referansların uyumu doğrulanmalı. Takipçi home AMSL = takipçi AMSL − takipçi relative_alt. |
+
+Dikey ayrım, tablodaki yükseklikten takipçinin `relative_alt` değeri çıkarılarak bulunur.
+Komut için tablodaki yüksekliğe `--alt-offset` eklenir. `--min-sep` ölçülen ayrıma, `--min-alt` komuta uygulanır.
+Aynı kotta kalkışta Talon 100 m ve ofset +10 m ise `--alt-match` ile komut 110 m olur.
+Farklı kotları `same-home` telafi etmez. Seçilen irtifa verisi eksikse takip durur; takipçinin geçerli konumu ve relative_alt verisi varsa mevcut pozisyonu tutulur.
+
+Orin `chase_state_*.csv` kayıtlarında `t_alt_rel`, `alt_ref`, `alt_offset_m` ve `sep_bias_m` her satırın sonundadır.
+Yeni link loglarının başlıklarında da referans ve bias bulunur. Eski CSV'lerde bu alanlar yoktur.
 
 - `--alt-offset D`: hedefin irtifasına göre ofset. **Pozitif = üstünde, negatif = altında.**
   Varsayılan **−3** (unutulsa bile küçük bir dikey marj). "5 m alttan takip" = `--alt-offset -5`.
@@ -125,8 +138,10 @@ riskidir** — özellikle INTERCEPT + küçük `|--alt-offset|`.
   `--alt-offset -8`). Aynı irtifa (`--alt-offset 0`) + intercept, iki EKF birkaç metre
   saparsa temas demektir.
 - **RC'de moda hazır dur.** Nihai güvenlik sensin; takipçi GUIDED'dan çıkınca script çekilir
-  ve **modu bir daha asla değiştirmez** (senin seçtiğin mod kalır). Script sadece Ctrl-C'de
-  ya da beklenmeyen bir hatada, takipçi hâlâ GUIDED'daysa LOITER'a alır.
+  (laptop `follow_gps.py`: kapanır; Orin `chase_orin.py`: duraklar, GUIDED'a dönünce devam
+  eder, bkz. "İptal / duraklatma") ve **modu bir daha asla değiştirmez** (senin seçtiğin mod
+  kalır). Script sadece Ctrl-C'de ya da beklenmeyen bir hatada, takipçi hâlâ GUIDED'daysa
+  LOITER'a alır.
 - **Bekleme = yerinde tut.** Hedef bayatlarsa, fix'i kaybederse, `--max-dist` aşılırsa ya da
   `--min-sep` tetiklenirse takipçi **olduğu yerde tutulur** (sim'in `--stale-hold` davranışı).
   Son carrot'a (250 m'ye kadar ileride) uçmaya devam etmez. Takipçinin kendi GPS'i yoksa
@@ -173,7 +188,85 @@ bayat (`relay_lat`), ve komutun karşıya gidip cevap dönmesi ne kadar sürüyo
 üçünü ayrı ayrı görürsün. Göremediğin tek şey: ortak saat olmadığı için bir paketin havada
 geçirdiği **tek yönlü** süre; ama RTT'nin ~yarısı iyi bir tahmindir.
 
-## Orin mimarisi (Aşama 1) — beyin takipçinin Orin'inde
+## Orin + radyo düzeni (SAHA, 24 Ekim 2026) — 3DR Orin USB'sinde
+
+Takipçinin 3DR'si FC'ye lehimli değil, USB-C ile Orin'e takılı. Radyo **sadece hedef verisini**
+taşır; komutlar ve takipçinin kendi durumu Orin↔FC USB'sinde kalır.
+
+```
+hedef kaynağı ──▶ Victus: relay_radio.py ──3DR──▶ Orin USB: chase_orin.py --target-link ... ──MAVProxy 14551/USB──▶ takipçi FC
+(Talon/Kırmızı UDP                        ◀──3DR── takipçi durumu ~2 Hz + chase_orin olayları
+ ya da hedef radyosu)
+```
+
+- Hedef radyodan, takipçi FC'den okunur (ayrı bağlantılar) → **aynı sysid olabilir** (Talon genelde 1).
+  Hedef sysid'i radyoda görülen ilk araç heartbeat'ine kilitlenir (`--target-sysid N` ile zorla).
+- Radyodan gelen hiçbir paket FC'ye iletilmez; FC'ye komut veren tek süreç chase_orin.
+- Victus **pasif**: kaynağa (Talon/MP) tek bayt gitmez. Kendi hedefin serideyse `--request-hz 10`.
+- Orin radyoya sadece şunları basar: Victus'un TIMESYNC'ine cevap (radyo RTT), takipçinin
+  HEARTBEAT (1 Hz) / konum (`--downlink-hz`, 2) / fix (0.5 Hz) / FC STATUSTEXT'leri ve chase_orin
+  olayları (başladı, intercept/follow, BEKLE, çıkış). `--downlink-hz 0` = sadece TIMESYNC cevabı.
+
+### Kurulum
+**Orin:**
+1. Radyoyu tak; `dmesg | tail` (çip: FTDI/CP210x/CH340) ve `ls -l /dev/serial/by-id/` ile yolu al.
+   Hep **by-id yolunu** ver: USB bir an çıkıp girerse numara (ttyUSB0/1) değişebilir, RX thread
+   aynı yolu 1 s'de bir yeniden açar. CH340 çıkar da port kayboluyorsa sebep brltty'dir:
+   `sudo systemctl mask --now brltty-udev.service` (Orin'de dpkg yarım; `apt remove` deneme).
+   `groups` çıktısında `dialout` olmalı.
+2. MAVProxy her zamanki gibi: `scripts/run_router_mavproxy.sh` (14551 = brain; değişiklik yok).
+   14551'e başka süreç bağlanmasın; izlemek için 14552.
+3. chase_orin **tmux içinde**: `tmux new -s takip` (SSH koparsa yeniden bağlan: `tmux attach -t takip`).
+
+**Victus:** iki radyo çifti (hedef + Orin) farklı NetID'de olmalı. Aynı bantta iki 500 mW radyo
+yan yana durursa biri yayın yaparken diğeri sağırlaşır; kendi hedef drone'unla test ederken hedef
+radyosunu Kırmızı'ya alıp Ethernet'ten (Talon'daki gibi) UDP ile ver.
+
+### Çalıştırma
+```
+Victus> python relay_radio.py --target udpin:0.0.0.0:14550 --radio COM5            # Talon / Kırmızı UDP
+Victus> python relay_radio.py --target COM12 --radio COM5 --request-hz 10          # hedef radyosu bu laptopta
+Orin>   tmux new -s takip
+Orin>   python3 chase_orin.py --target-link /dev/serial/by-id/usb-XXXX --alt-ref same-home --dry-run
+Orin>   python3 chase_orin.py --target-link /dev/serial/by-id/usb-XXXX --alt-ref same-home --set-mode
+```
+Victus satırı: `HEDEF` (kaynak) | `TAKIPCI` (Orin'den aşağı) | `d` / `ayrim` | `aktarim /s` | radyo `rtt`.
+Victus üzerindeki relay'in `ayrim` alanı ham AMSL farkını gösterir. Seçtiğin irtifa referansındaki ayrım Orin ekranında ve Orin logundadır.
+`>>> [ORIN] ...` satırları chase_orin olaylarıdır, `>>> [TAKIPCI FC] ...` FC'nin kendi mesajları.
+
+### FC parametreleri — GCS failsafe chase_orin'e bağlı (önce SITL'de doğrula)
+| Param | Değer | Not |
+|---|---|---|
+| `MAV_GCS_SYSID` (4.7; eskisi `SYSID_MYGCS`) | 251 | chase_orin'in sysid'i (`--src-sysid`) |
+| `FS_GCS_ENABLE` | 7 | Brake (firmware'de yoksa Land) |
+| `FS_GCS_TIMEOUT` | 3 | s |
+| `FS_OPTIONS` | + "Continue if in pilot controlled modes on GCS failsafe" | LOITER/ALTHOLD'da etkisiz |
+
+Etki: chase_orin'in heartbeat'i 3 s kesilir **ve** takipçi GUIDED'daysa fren yapar; elle uçarken bir
+şey olmaz. Bilinmesi gerekenler: sysid 255'ten RC_OVERRIDE artık reddedilir; RTL pozisyonuyla abort
+edilirse 3 s sonra BRAKE'e çevirir (LOITER ile abort sorunsuz); failsafe'ten çıkmak için mod anahtarını
+oynat. Bu parametreler olmadan chase_orin'in/Orin'in ölümünü FC fark etmez (MAVProxy'nin heartbeat'i
+sysid 250 ile sürer): takipçi son carrot'a (≤250 m önde) gider ve GUIDED'da asılı kalır.
+
+### Arıza davranışı
+| Olay | Sonuç |
+|---|---|
+| radyo kopar / Victus relay durur | 3 s sonra hedef bayat → takipçi yerinde tutulur; veri gelince devam |
+| Orin'de radyo USB'si çıkar | aynısı; port kendiliğinden yeniden açılır |
+| SSH kopar, chase_orin tmux içinde | hiçbir şey; takip sürer |
+| SSH kopar tmux dışında (SIGHUP) / SIGTERM | temiz çıkış: GUIDED'daysa LOITER |
+| GUIDED'a geçiş sırasında Ctrl-C/sinyal | FC GUIDED'a geçmişse LOITER'a geri alınır |
+| chase_orin/Orin ölür (kill -9, güç) | failsafe yoksa son carrot + GUIDED'da asılı; varsa 3 s sonra BRAKE |
+| pilot mod anahtarını çevirir (LOITER, ALT_HOLD …) | chase_orin DURAKLAR: komut yok, moda dokunmaz, loglar; GUIDED'a dönünce takip devam eder (`--exit-on-pilot`: eskisi gibi çıkar) |
+
+### Loglar
+- **Orin:** `hedef_link` = radyo bağlantısının tamamı (hedef + 250 Victus TIMESYNC + 51 SiK
+  RADIO_STATUS varsa rssi'leriyle), `chaser_link` (USB), `relay_lat`, `cmd_lat` (USB RTT), `chase_state`.
+  Yukarı yönün kaybı = `hedef_link`'te hedefin `GLOBAL_POSITION_INT` `gap_ms` dağılımı.
+- **Victus:** `hedef_link` (kaynak), `chaser_link` (radyodan aşağı gelenler), `cmd_lat`
+  (`command=TIMESYNC`: radyonun gidiş-dönüşü; `rtt_lost` = cevapsız ping).
+
+## Orin mimarisi (Aşama 1, ESKİ DÜZEN: radyo FC'de) — beyin takipçinin Orin'inde
 
 ```
 HEDEF FC --SiK--> laptop: relay_target.py --SiK--> TAKIPCI FC --USB--> MAVProxy --UDP--> chase_orin.py
@@ -220,18 +313,41 @@ Orin>   python3 chase_orin.py --dry-run
 ### Saha
 ```
 laptop> python relay_target.py --target-port COM5 --chaser-port COM14
-Orin>   python3 chase_orin.py --dry-run                         # önce: ayrım oku, --sep-bias bul
-Orin>   python3 chase_orin.py --sep-bias <m> --set-mode         # kovala
+Orin>   python3 chase_orin.py --alt-ref same-home --dry-run
+Orin>   python3 chase_orin.py --alt-ref same-home --set-mode
 ```
 Bayraklar ve varsayılanlar laptop şekliyle aynıdır (`--max-speed`, `--alt-offset`,
 `--min-sep` …). Orin'e özgü olanlar: `--fc`, `--chaser-sysid 1`, `--target-sysid 2`,
 `--pos-hz 10`, `--att-hz 10`, `--rate 10`. Döngü ayrıca her yeni hedef fix'inde hemen uyanır.
 `--print-hz 2` ile SSH'e seyrek yazar; loglar her tiki alır.
 
-**İptal:** RC mod anahtarı. Script takipçinin GUIDED'dan çıktığını görür, durur ve moda bir daha
-dokunmaz. SSH'ten Ctrl-C → takipçi LOITER. **SSH/SIYI linki koparsa tek iptal RC'dir; elin
-anahtarda olsun.** Laptop'taki relay durursa hedef bayatlar ve takipçi `--max-age` (3 s) sonra
-yerinde tutulur.
+**İptal / duraklatma:** RC mod anahtarı. Takipçiyi GUIDED'dan çıkarınca (LOITER, ALT_HOLD …)
+chase_orin **kapanmaz, duraklar**: hiçbir komut göndermez, moda dokunmaz, loglamaya ve hedef
+akışını izlemeye devam eder, 5 s'de bir "DURAKLATILDI" hatırlatması basar. Anahtarı tekrar
+GUIDED'a alınca takip **kendiliğinden devam eder** (kodu yeniden başlatmak, dronu indirmek
+gerekmez). Eski davranış (pilot devralınca kapan) için `--exit-on-pilot`. SSH'ten Ctrl-C →
+takipçi GUIDED'daysa LOITER; duraklatılmışken Ctrl-C moda dokunmaz. **SSH/SIYI linki koparsa
+tek iptal RC'dir; elin anahtarda olsun.** Laptop'taki relay durursa hedef bayatlar ve takipçi
+`--max-age` (3 s) sonra yerinde tutulur.
+
+### Pilot devri: duraklat / devam (chase_orin)
+- **Duraklarken:** döngü çalışmaya devam eder ama pozisyon hedefi, `DO_CHANGE_SPEED` ve RTT
+  ping'i dahil FC'ye hiçbir şey gitmez (testte sıfır bayt). `chase_state_*.csv`'de bu satırlar
+  `phase=paused`, `why=PILOT <mod>` olarak görünür; iki aracın durumu yine kaydedilir.
+  Telsizli düzende yere `chase_orin DURAKLADI: pilot (<mod>)` olayı gider.
+- **Devam ederken:** FC'nin modu tekrar GUIDED olunca (HEARTBEAT ~1 Hz, en çok ~1 s gecikir)
+  yeni bir `TrackController` kurulur: Kalman filtresi, hız ve yön sınırlayıcıları, setpoint
+  tutucu ve catch-up mandalı sıfırdan başlar. Pilot dronu uçurmuşken eski planlayıcı durumu
+  geçersizdir. Hız komutu gerçek yer hızından başlar (pilot 10 m/s'de bırakmışsa fren değil
+  ~10 m/s ile devam). ArduCopter GUIDED'a yeniden girince aktif hızı `WP_SPD`'ye sıfırladığı
+  için ilk 3 tikte `DO_CHANGE_SPEED` zorla yeniden gönderilir (`ChaserEnv.force_speed_resend`).
+  Parametre yazılmaz (`WP_SPD` tavanı yalnızca başlangıçta ayarlanır; FC'yi yeniden başlatırsan
+  scripti de baştan başlat). Kapılar (`--max-dist`, `--min-sep`, bayat hedef) aynen devrede.
+- **Dikkat:** GUIDED'a geçtiğin an takip başlar. Anahtarı çevirmeden önce takipçinin hedefe
+  göre konumuna ve irtifasına bak; planlayıcı ilk tikte hemen hedefe yönelir.
+- **Günlükte:** çıkışta `gonderim=… yerinde-tut=… duraklama=N (T s)` satırı basılır
+  (sayaçlar tüm devamlar boyunca toplanır).
+- Sadece Orin'deki `chase_orin.py` için. Laptop `follow_gps.py` eskisi gibi pilot devralınca çıkar.
 
 ### Loglar
 - **Orin** (`logs/`): `hedef_link` (hedef, iki atlama sonrası Orin'in gördüğü hâli),
@@ -282,8 +398,9 @@ ve REALIGN (Aşama 4) kendi offline testleriyle birlikte açılacak.
 | `--accel` | 4 | WP_ACC / planlayıcı ivme sınırı |
 | `--carrot` | 250 | carrot ön-bakış mesafesi |
 | `--alt-offset` | -3 | hedefe göre dikey ofset (+üst / −alt) |
+| `--alt-ref` | amsl | aynı kotta kalkış için `same-home` seçilir |
 | `--alt-match` | AÇIK | temiz irtifa modu; `--no-alt-match` ile balon mantığına dön |
-| `--sep-bias` | 0 | dry-run'da ölçülen sistematik ayrım düzeltmesi |
+| `--sep-bias` | 0 | AMSL modunda aynı fiziksel yükseklikte ölçülen ham ayrım |
 | `--min-alt` | 10 | komut irtifası tabanı |
 | `--min-sep` | 0 (kapalı) | ölçülen dikey ayrım sigortası |
 | `--rate` | 10 | kontrol/carrot gönderme hızı (Hz) |
@@ -329,3 +446,7 @@ geçerli tikte çökerdi:
 9. **Orin modunda radyo gecikmesi:** relay artık takipçi radyosunun RTT'sini laptop modundakiyle
    aynı ping'le ölçüyor (`cmd_lat`). README'deki "`target_age` farkı = ek atlama" kıyası yanlıştı,
    kaldırıldı (bkz. "Gecikme: iki modu karşılaştırma").
+10. **Orin: pilot LOITER'a alınca program kapanıyordu** (dronu indirip kodu Orin'den yeniden
+    başlatmak gerekiyordu). Artık `chase_orin.py` duraklar ve kumandadan GUIDED'a dönülünce
+    takibe kendiliğinden devam eder; `--exit-on-pilot` eski davranışı geri getirir
+    (bkz. "Pilot devri: duraklat / devam"). Testler: `test_orin.py` grup 7b, `test_radio.py` grup 7.

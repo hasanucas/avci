@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from fpv_gate_il.gate_gps import GateGpsSample, bearing_ned_rad
@@ -18,6 +18,10 @@ from fpv_gate_il.gate_gps import GateGpsSample, bearing_ned_rad
 # GazeboDroneTrackingEnv` annotation a lazy string that is never evaluated, so
 # guarding the import under TYPE_CHECKING keeps the file byte-for-byte
 # behaviourally identical while removing the heavy Gazebo dependency.
+# SYNC NOTE (5 Nov 2026): body is the friend's fpv-gate-il mav_bridge.py of
+# 9 Oct 2026 (adds coast_* helpers + gate_sample_from_ned). The ONLY local
+# deviation from upstream is this TYPE_CHECKING guard; re-apply it on every
+# future sync.
 if TYPE_CHECKING:  # pragma: no cover
     from fpv_gate_il.gazebo_drone_env import GazeboDroneTrackingEnv
 from fpv_gate_il.trajectory.config import TrajectoryConfig
@@ -378,6 +382,88 @@ def traj_hold_alt_m(
     ):
         clearance = near_clearance
     return min(gate_alt + clearance, match_above)
+
+
+def coast_target_state(target: TargetState, now_s: float) -> TargetState:
+    """Constant-velocity copy at ``now_s``. Does not touch the Kalman filter."""
+    dt = float(now_s) - float(target.timestamp_s)
+    if dt <= 0.0:
+        return target
+    position = NedPosition.from_array(
+        target.position.as_array() + target.velocity.as_array() * dt
+    )
+    return replace(target, position=position, timestamp_s=float(now_s))
+
+
+def _shift_position(pos: NedPosition, dn: float, de: float, dd: float) -> NedPosition:
+    return NedPosition(
+        north_m=pos.north_m + dn,
+        east_m=pos.east_m + de,
+        down_m=pos.down_m + dd,
+    )
+
+
+def _shift_path(path: Path, dn: float, de: float, dd: float) -> Path:
+    waypoints = [
+        replace(wp, position=_shift_position(wp.position, dn, de, dd))
+        for wp in path.waypoints
+    ]
+    final = path.final_position
+    if final is not None:
+        final = _shift_position(final, dn, de, dd)
+    return replace(path, waypoints=waypoints, final_position=final)
+
+
+def coast_planner_output(
+    output: PlannerOutput,
+    drone: DroneState,
+    *,
+    now_s: float,
+) -> PlannerOutput:
+    """
+    Extrapolate the last plan with the target's constant velocity.
+
+    The source output and the Kalman state are left unchanged. Path
+    geometry shifts with the target so the carrot still aims at the
+    predicted engagement, and range is recomputed from the live drone.
+    """
+    target = output.target
+    if target is None:
+        return output
+    coasted = coast_target_state(target, now_s)
+    dn = coasted.position.north_m - target.position.north_m
+    de = coasted.position.east_m - target.position.east_m
+    dd = coasted.position.down_m - target.position.down_m
+    path = output.path
+    if path is not None and (dn != 0.0 or de != 0.0 or dd != 0.0):
+        path = _shift_path(path, dn, de, dd)
+    return replace(
+        output,
+        path=path,
+        target=coasted,
+        distance_to_target_m=distance_m(drone.position, coasted.position),
+    )
+
+
+def gate_sample_from_ned(
+    position: NedPosition,
+    config: TrajectoryConfig,
+    *,
+    recv_mono: float,
+) -> GateGpsSample:
+    """NED position → gate sample so altitude and the no-path fail-safe match."""
+    lat, lon, alt = local_to_latlonalt(
+        position,
+        home_lat_deg=config.home_lat_deg,
+        home_lon_deg=config.home_lon_deg,
+        home_alt_m=config.home_alt_m,
+    )
+    return GateGpsSample(
+        lat=lat,
+        lon=lon,
+        alt=alt,
+        recv_mono=float(recv_mono),
+    )
 
 
 def gate_sample_to_radar(
