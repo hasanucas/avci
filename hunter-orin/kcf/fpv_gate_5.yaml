@@ -1,0 +1,302 @@
+# fpv-gate-il unified runtime config.
+# Obs/action contract (camera_bridge + teachers + BC/RL) + HCAir parameters.
+
+image:
+  width: 1920
+  height: 1080
+  hfov_deg: 80.0
+  # Gimbal neutral mount pitch (obs[12] / camera_pitch_deg).
+  # Sign: positive = depression (down), negative = up. -15 = 15 deg up.
+  pitch_deg: -15.0
+
+observation:
+  vision:
+    - bbox_cx
+    - bbox_cy
+    - bbox_w
+    - bbox_h
+    - angular_x_deg
+    - angular_y_deg
+  attitude:
+    - roll_deg
+    - pitch_deg
+    - yaw_deg
+    - roll_rate_dps
+    - pitch_rate_dps
+    - yaw_rate_dps
+  meta:
+    - camera_pitch_deg
+    - bbox_valid
+
+action:
+  - roll_cmd
+  - pitch_cmd
+  - throttle_cmd
+  - yaw_cmd
+
+dimensions:
+  obs: 14
+  action: 4
+
+bridge:
+  tcp_port: 9999
+  mavlink_port: 14552
+  packet_magic: 0x44524F4E  # "DRON"
+  # iris_runway + iris_with_gimbal (ArduPilot gazebo); find with: gz topic -l | grep camera/image
+  camera_topic: /world/iris_runway/model/iris_with_gimbal/model/gimbal/link/pitch_link/sensor/camera/image
+
+hc_air:
+  # HCAir hard-coded teacher. Her değer bağımsızdır (birbirinden türetilmez).
+  # image.pitch_deg ile uyum gereken alanlar yorumda belirtilir.
+  #
+  # 80° kamera: obs açıları eski 114° analitik modele göre ~1.86×
+  # (tan(57°)/tan(40°)). Görüş açısına bağlı derece/dps eşikleri ×1.86,
+  # açı başına kazançlar ×0.54. Gövde attitude döngüleri ölçeklenmedi.
+
+  output:
+    # body_rate — SET_ATTITUDE_TARGET rad/s (default, guided_no_fps).
+    # acro_rc   — body rate hesaplanır, ArduPilot ACRO PWM'e çevrilir; env MAVLink RC override gönderir.
+    mode: body_rate
+
+  acro:
+    rp_rate_deg_s: 360.0
+    rp_expo: 0.3
+    yaw_rate_deg_s: 202.5
+    yaw_expo: 0.0
+    thr_mid_curve: 0.5
+    # Teacher hover_thrust (0.07) → firmware normalized thrust (≈ hover motor).
+    hover_thrust_firmware: 0.33
+    thrust_scale: 0.50
+    rate_limits:
+      p_max_rad_s: 1.20
+      q_max_rad_s: 1.20
+      r_max_rad_s: 1.00
+      max_rp_stick_radius: 0.85
+    channels:
+      roll: 1
+      pitch: 2
+      throttle: 3
+      yaw: 4
+    rc:
+      roll:     {min_pwm: 1000, trim_pwm: 1500, max_pwm: 2000, deadzone: 20, reversed: false}
+      pitch:    {min_pwm: 1000, trim_pwm: 1500, max_pwm: 2000, deadzone: 20, reversed: false}
+      throttle: {min_pwm: 1000, trim_pwm: 1500, max_pwm: 2000, deadzone: 0,  reversed: false}
+      yaw:      {min_pwm: 1000, trim_pwm: 1500, max_pwm: 2000, deadzone: 20, reversed: false}
+
+  platform:
+    # Sim / gerçek drone hover collective (0..1). Thrust FF ve tilt comp tabanı.
+    hover_thrust: 0.07
+    # SET_ATTITUDE_TARGET thrust komut alt/üst sınırı (env clip ile aynı olmalı).
+    thrust_cmd_min: -0.2
+    thrust_cmd_max: 0.5
+    # Privileged (EKF vz) yokken açık çevrim FF thrust çarpanı.
+    ff_open_loop_scale: 1.08
+    # Bank/pitch tilt compensation: cos(tilt) bu değerin altına inmez.
+    tilt_cos_min: 0.5
+
+  action_limits:
+    # Body rate komut tavanları (rad/s). Env step() clipping ile uyumlu.
+    roll_rad_s: 1.884955592153876
+    pitch_down_rad_s: 0.3769911184307752
+    pitch_up_rad_s: 0.3769911184307752
+    yaw_rad_s: 1.0602875205865552
+
+  camera:
+    # obs[12] yoksa kullanılan varsayılan gimbal pitch (derece).
+    # image.pitch_deg ile aynı tutun (-15 = 15° yukarı mount).
+    pitch_default_deg: -15.0
+    # Dikey LOS offset (derece). Gate elevation = offset + transfer*pitch - ang_y.
+    # Bağımsız değer; tipik sim için 15 (= -pitch_default).
+    axis_offset_deg: 15.0
+    # Body pitch'in gate elevation'a katkısı (0=ihmal, 1=tam).
+    pitch_transfer: 0.85
+
+  yaw:
+    # ang_x deadband (derece); altında yaw komutu sıfır. 0.10 × 1.86.
+    ang_x_deadband_deg: 0.19
+    # Yatay nişan P: ang_x (deg) → yaw rate (rad/s). 0.11133 × 0.54.
+    kp_rad_s_per_deg: 0.06011830241725768
+    # Yaw rate D: body yaw rate (deg/s) → damping (rad/s). Gövde döngüsü, ölçeklenmedi.
+    kd_body_rad_s_per_dps: 0.010602875205865551
+    # Yaw rate komut satürasyonu (rad/s).
+    max_cmd_rad_s: 0.9542587685278996
+
+  pitch_attitude:
+    # Closure governor hedef pitch (derece, negatif = burun aşağı).
+    cruise_des_deg: -9.5
+    des_min_deg: -24.0
+    des_max_deg: 8.0
+    # vz fazla yüksekken pitch tavanını gevşet (climb assist).
+    assist_climb_err_mps: 1.5
+    assist_sink_err_mps: 2.5
+    assist_k_deg_per_mps: 3.0
+    assist_max_deg: 8.0
+    # Sink assist aktifken pitch taban sınırı (daha az agresif dive).
+    des_min_relaxed_deg: -14.0
+    # EKF yokken sabit pitch hedefi (derece).
+    fallback_des_deg: -6.0
+    # Pitch attitude inner loop: pitch error (deg) → pitch rate (rad/s).
+    kp_rad_s_per_deg: 0.021205750411731103
+    kd_body_rad_s_per_dps: 0.01884955592153876
+    max_cmd_rad_s: 0.40055306333269863
+
+  pitch_governor:
+    # Filtrelenmiş bbox closure hedefi (1/s, pozitif = yaklaşma).
+    closure_target_per_s: 0.05
+    closure_filt_alpha: 0.08
+    # Closure hatasına göre pitch_des ramp (deg/s per closure unit).
+    ramp_up_deg_s_per_unit: 12.0
+    ramp_down_deg_s_per_unit: 4.0
+    # pitch_des değişim hız tavanı (deg/s).
+    des_accel_max_deg_s: 12.0
+    # Track lock sonrası governor devreye girmeden bekleme (s).
+    warmup_s: 1.0
+    # Governor gate: max |ang_x| (deg) normal / receding mod. ×1.86.
+    aim_max_deg: 5.6
+    chase_aim_max_deg: 18.6
+    # Governor gate: |pitch_des - pitch| max (deg). Gövde hatası, ölçeklenmedi.
+    pitch_err_max_deg: 12.0
+    # Governor gate: |vz_des - vz_up| max (m/s) normal / receding.
+    vz_err_max_mps: 3.0
+    chase_vz_err_max_mps: 5.5
+    # closure_filt bu eşiğin altında "receding" (kapı uzaklaşıyor).
+    recede_threshold_per_s: 0.0
+    # Küçük bbox'ta yavaşlama governor'ı devreye girmez (norm. bbox size).
+    no_slowdown_size: 0.03
+    # Bbox kaybı sonrası lock timer sıfırlama eşiği (s).
+    lock_reset_after_s: 0.5
+    # Dikey hata büyükken pitch_des'i cruise'a doğru gevşet (deg/s).
+    vert_brake_deg_s: 1.5
+    # Bbox kaybında pitch_des decay başlangıç gecikmesi (s).
+    lost_des_decay_after_s: 2.0
+    lost_des_decay_deg_s: 3.0
+
+  guidance:
+    # Eski PN kazancı. Yatış artık k_bank ile gelir; bu değer kullanılmıyor.
+    nav_constant: 4.0
+    # Yatış tavanı (derece). Ani 35° kesişimi kapıyı kadrajdan atıyordu.
+    bank_max_deg: 22.0
+    # LOS azimut hızı (deg/s) başına yatış (derece). Seyir ve dalışta aynı.
+    # 3.8, 15 m/s kapanışta etkin N≈2.5 bırakıyordu; LOS hızı sönmüyor, yan hız birikiyordu.
+    k_bank_deg_per_dps: 6.0
+    # Hedef yatışın değişim tavanı (derece/s).
+    bank_slew_deg_s: 12.0
+    # Kilitten sonra LOS filtresi oturana kadar yatış yok.
+    match_warmup_s: 0.8
+    # Jiroskop tutumunun EKF'ye çekilme süresi (s). EKF eğimi ivmede kayıyor.
+    att_ekf_tau_s: 60.0
+    # Dikey hız komutunun değişim tavanı (m/s²). Yaklaşmaya geçişte dalış sıçramasın.
+    vz_slew_mps2: 2.5
+    # Kilit boyutunda LOS yükseliş hızı (°/s) başına dikey hız (m/s).
+    # Kutu büyüdükçe kazanç orana bölünür: aynı açısal hız yakında daha küçük hız hatasıdır.
+    # 4.2 ≈ 240 m × π/180. Negatif hız = alçalma. İntegral, hız sıfırlanınca alçalmayı tutar.
+    k_el_p_mps_per_dps: 4.2
+    k_el_i_mps_per_dps_s: 1.0
+    # Depresyon bu açının üstündeyken çarpışma rotasından hızlı alçal, sonra tut.
+    # Açı jiroskop tutumundan gelir. Böylece irtifa farkı uzakta kapanır.
+    dep_target_deg: 4.5
+    # Depresyon hatası (derece) başına istenen LOS yükseliş hızı (°/s).
+    k_el_shallow_dps_per_deg: 0.20
+    el_shallow_rate_max_dps: 1.2
+    # Kapı bu kadar alta inince kadraj kenarı ek alçalma ister. Yarı görüş ~25°.
+    ang_y_guard_deg: 18.0
+    ang_y_hold_deg: 12.0
+    k_frame_vz_mps_per_deg: 0.25
+    frame_sink_max_mps: 4.0
+    frame_climb_max_mps: 0.6
+    # Artık dalış eşiği değil; yer koruması irtifa tabanlarıyla yapılır.
+    dive_depression_deg: 25.0
+    # Bu irtifanın altında seyirde ve kilit yokken çökme yasak; daha altında tırmanış.
+    alt_floor_m: 8.0
+    alt_climb_m: 4.0
+    # Kilitliyken dalış kapı yüksekliğine inebilir. Kilit düşünce üstteki tabana dönülür.
+    alt_floor_dive_m: 2.0
+    alt_climb_dive_m: 1.0
+    k_alt_hold: 0.4
+    alt_hold_vz_max_mps: 2.0
+    # |ang_x| bunun altındayken yaw kazancı yumuşar; kadraj kenarında tam kazanç.
+    yaw_soft_deg: 12.0
+    yaw_soft_scale: 0.85
+
+  roll:
+    # Banka açısı takibi: (roll_des - roll) deg → roll rate (rad/s).
+    kp_level_rad_s_per_deg: 0.05654866776461628
+    # Eski hız-oranlı crab. Artık kullanılmıyor; yatış guidance.nav_constant ile gelir.
+    kp_crab_los_rad_s_per_dps: 0.04580442088933918
+    # Bu alpha, dünya azimut/elevasyon α-β filtresinin alpha'sıdır.
+    los_az_filt_alpha: 0.36
+    # Bbox kaybında LOS az filt decay çarpanı (her adım).
+    los_az_lost_decay: 0.8
+    max_cmd_rad_s: 1.0367255756846316
+
+  vertical_thrust:
+    # Dikey hız PI: vz error (m/s) → thrust delta.
+    kp: 0.120
+    ki: 0.040
+    # LOS pursuit: vz_des = k_pursuit * v_eff * tan(elev).
+    k_pursuit: 1.8
+    # Referans pursuit hızı (m/s); GPS yok, sabit taban hız.
+    v_pursuit_ref_mps: 15.0
+    vz_int_max: 0.22
+    vz_des_max_mps: 12.0
+    t_fb_max: 0.45
+    # Bbox kaybında vz_des hold decay tau (s).
+    lost_vz_decay_tau_s: 1.0
+
+  vertical_adapt:
+    # Elevation lag pozitifken v_adapt artış kazancı (m/s per deg drift). ×0.54.
+    k_per_deg: 8.1
+    v_max_mps: 35.0
+    decay_tau_s: 4.0
+    # elev lag işareti deadband (deg). 0.5 × 1.86.
+    lag_sign_deadband_deg: 0.93
+    elev_drift_filt_alpha: 0.3
+    # Frame başına max |d_elev| (deg); spike kırpma. 0.6 × 1.86.
+    elev_drift_step_max_deg: 1.1
+
+  dive_phase:
+    # bbox_size / kilit boyutu bu oranı geçince ve |ang_x| küçükse dalış.
+    size_ratio: 2.5
+    # Yalnız yatay nişan (derece). ang_y bilerek merkezin altında tutulur.
+    aim_max_deg: 6.0
+    # Kilit açısından bu kadar daha alta kayınca ve mutlak eşik aşılınca dalış.
+    # İlk 0.5 saniye referanstır. Yer kapısı kilitte zaten 20°'nin altındaysa
+    # bu tetik açılmaz; dalış bbox büyümesini bekler.
+    ang_y_deg: 20.0
+    ang_y_margin_deg: 2.0
+    # Kilit boyutunu bu kadar saniye ortala; tek kare ~16 px gürültülü.
+    ref_window_s: 0.5
+
+  lost_behavior:
+    # Bbox yokken yaw scan genliği (rad/s).
+    yaw_scan_rad_s: 0.10602875205865551
+    # EKF yokken hedef pitch (derece).
+    pitch_target_deg: -3.0
+    # EKF yokken pitch P kazancı (deg error → rad/s). Gövde döngüsü, ölçeklenmedi.
+    pitch_kp_rad_s_per_deg: 0.011780972450961725
+    # Lost mod yaw komut çarpanı (mem ang_x üzerinde).
+    yaw_kp_scale: 0.25
+    # Lost mod roll komut çarpanı.
+    roll_cmd_scale: 0.5
+    # Lost mod pitch komut çarpanı (max_pitch ile çarpılır).
+    pitch_cmd_scale: 0.4
+
+  dynamics:
+    # Bbox büyüme hızı filt alpha.
+    bbox_rate_alpha: 0.25
+    # Bbox kaybında bbox_rate decay çarpanı.
+    bbox_rate_lost_decay: 0.8
+    # Varsayılan kontrol adımı (s); wall clock yoksa 1/default_hz.
+    default_dt_s: 0.03333333333333333
+
+  smoothing:
+    # EMA alpha per kanal: roll, pitch, thrust, yaw.
+    alpha_roll: 0.45
+    alpha_pitch: 0.58
+    alpha_throttle: 0.40
+    alpha_yaw: 0.50
+    # Komut slew rate limitleri (rad/s veya thrust/s).
+    roll_rate_limit_rad_s: 0.7539822368615504
+    pitch_rate_limit_rad_s: 0.5654866776461628
+    yaw_rate_limit_rad_s: 0.5831581363226054
+    throttle_rate_limit_per_s: 0.12

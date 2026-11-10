@@ -8,6 +8,16 @@
 //   KILIT : SADECE KCF. Tespit DURUR (thread bosta). Hicbir sey karismaz.
 //           Kilit "YOLO onaylamadi" diye ASLA dusmez.
 //
+// [9 KAS 2026] MANUEL KILIT — pilot butonu (--ch-lock, latching).
+//   Yukaridaki kilit OTOMATIK: 20/30 tutarlilik bekler. Pilot ekrandan
+//   hedefin dogru oldugunu goruyor ve daha erken gecmek istiyor.
+//   forceLock() ayni kapiyi (initBox_ + wantInit_) daha erken aciyor —
+//   AYRI BIR KOD YOLU DEGIL. Buton bir DURUM: acikken her karede denenir,
+//   aday yeterli kanita ulasinca kilitlenir; kapaninca release() ile
+//   ARAMA'ya doner ve YOLO yeniden baslar.
+//   Manuel kilit de ADAY kutuyu kullanir (zamansal kaniti var), tek karenin
+//   en yuksek skorlusunu DEGIL — sebebi Config.manualMinHits yorumunda.
+//
 // Onceki surumde kilitliyken periyodik kontrol ve "daha iyi hedefe gecis"
 // vardi. Kaldirildi: gecisler 11-22 derecelik isinlanmalar uretiyordu
 // (1337 karede 5 kez) ve kutunun BUYUMESINI zaten duzeltmiyordu.
@@ -72,6 +82,29 @@ struct Config {
     double growthTrigger = 2.5;   // referansin kac kati tetikler
     double growthReset   = 1.5;   // referansin kac katina cekilir
     double growthMinPx   = 50.0;  // bu boyutun altinda kural UYGULANMAZ
+
+    // --- [9 KAS] MANUEL KILIT (pilot butonu, --ch-lock)
+    // Otomatik kilit lockHits/lockWindow (20/30) bekler. Pilot ekrandan
+    // hedefin dogru oldugunu GORUYOR, o yuzden butonla daha erken geciyor.
+    // Ama "hemen, sorgusuz" OLMAZ: en yuksek skorlu TEK KARE tespitine
+    // kilitlenmek false positive'e karsi en zayif secenek — bastigi karede
+    // bir bulut/doku tesadufen yuksek skor verirse ona kilitlenir ve YOLO
+    // o andan sonra KAPALI oldugu icin duzeltecek hicbir sey kalmaz
+    // (27 Agu ikinci ucusu: KCF balonu kaybedip uzaktaki sabit dokuya
+    // yapisti, bbox 36 s boyunca 0.019'da dondu, irtifa 68->198 m).
+    //
+    // Bu yuzden manuel kilit de ADAY kutuyu kullanir (IoU ile yapiskan,
+    // zamansal kaniti var) ve adayin en az manualMinHits karede tutturmus
+    // olmasini ister. 3 kare ~0.1 s — otomatik 20/30'un yaninda hala cok
+    // hizli, ama tek karelik parlamaya kilitlenmiyor.
+    int    manualMinHits = 3;     // butonla kilit icin asgari aday kaniti
+
+    // Manuel kilit varken OTOMATIK kilidi kapat.
+    // Neden: ikisi birden acik kalirsa makine 20/30'da pilottan ONCE
+    // kilitler ve tespit durur — yani buton islevsiz kalir, ustelik
+    // "detection calisirken ben basinca" akisi bozulur. --ch-lock verilince
+    // runtracker bunu true yapar ve acilista basar.
+    bool   manualOnly    = false;
 };
 
 enum class State { SEARCH, LOCK };
@@ -99,6 +132,50 @@ public:
     //   ARAMA : her zaman
     //   KILIT : sadece varlik kontrolu penceresi acikken (varsayilan hic)
     bool detectionWanted() const { return state_ == State::SEARCH || presOpen_; }
+
+    // ---- [9 KAS] MANUEL KILIT — pilot butonu (--ch-lock, latching)
+    //
+    // Buton bir DURUM, kenar degil. Ana dongu buton ACIK oldugu her karede
+    // bunu cagirir:
+    //   KILIT'teyse       -> false, hicbir sey yapma (zaten kilitli)
+    //   aday yoksa/zayifsa-> false, bekle (buton acik kalsin, kanit gelince
+    //                        kendiliginden kilitlenir)
+    //   aday yeterliyse   -> kilidi KUR, true don
+    // Boylece "erken bastim" reddedilmek yerine "yeterince emin olunca
+    // kilitle" anlamina gelir.
+    //
+    // Kilit kurulumunun KENDISI otomatik yolla BIREBIR AYNI: initBox_ +
+    // wantInit_ -> ana dongu KCF'i kurar -> initDone() LOCK'a gecirir ve
+    // buyume referansini yazar. Yani manuel kilit ayri bir kod yolu DEGIL,
+    // sadece ayni kapiyi daha erken aciyor.
+    bool forceLock() {
+        if (state_ != State::SEARCH) return false;
+        if (wantInit_) return false;               // kurulum zaten kuyrukta
+        if (!hasCand_ || !cand_.ok()) return false;
+        if (hitCount_ < cfg_.manualMinHits) return false;
+        initBox_  = cand_;
+        wantInit_ = true;
+        ++manualLocks_;
+        char b[160];
+        std::snprintf(b, sizeof(b),
+            "manual_lock #%lld  %d/%d kare  (%.0f,%.0f %.0fx%.0f)",
+            manualLocks_, hitCount_, (int)win_.size(),
+            cand_.x1, cand_.y1, cand_.w(), cand_.h());
+        event_ = b;
+        return true;
+    }
+
+    // Buton acik ama kilit KURULAMIYOR — neden? OSD/konsol icin.
+    // Bos string = engel yok (ya kilitli ya da bu karede kuruldu).
+    const char* manualBlockReason() const {
+        if (state_ == State::LOCK) return "";
+        if (wantInit_)             return "";
+        if (!hasCand_)             return "aday yok";
+        if (hitCount_ < cfg_.manualMinHits) return "kanit az";
+        return "";
+    }
+
+    long long manualLocks() const { return manualLocks_; }
 
     // ---- 1) Kare basi: KCF sonucu (sadece KILIT'te anlamli)
     void onTrackerResult(bool valid, const BoxF& b) {
@@ -216,7 +293,10 @@ private:
             event_ = "candidate_dropped";
             return;
         }
-        if (hasCand_ && hitCount_ >= cfg_.lockHits) {
+        // manualOnly: kilidi SADECE pilot butonu kurar (bkz. Config notu).
+        // Aday/pencere sayaclari yine islenir — buton bastiginda forceLock()
+        // onlara bakiyor, yani arama mantigi aynen kosmaya devam eder.
+        if (!cfg_.manualOnly && hasCand_ && hitCount_ >= cfg_.lockHits) {
             initBox_  = cand_;
             wantInit_ = true;
             char b[128];
@@ -261,6 +341,7 @@ private:
     Config cfg_;
     State  state_ = State::SEARCH;
     BoxF   box_{}, cand_{}, initBox_{};
+    long long manualLocks_ = 0;        // [9 KAS] butonla kac kez kilitlendi
     bool   hasBox_ = false, hasCand_ = false, wantInit_ = false;
     std::deque<int> win_;
     int    hitCount_ = 0, invalidRun_ = 0, outsideRun_ = 0;

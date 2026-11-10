@@ -66,11 +66,41 @@ def _deep_get(cfg: dict[str, Any], dotted: str, default: Any = None) -> Any:
 
 @lru_cache(maxsize=8)
 def load_hc_air_config(path: str | None = None) -> dict[str, Any]:
+    """Teacher config'ini yukle. `hc_air:` sarmalayicisi varsa ACILIR.
+
+    HUNTER NOTU (9 Kas 2026) — `hc_air:` ACMA EKLENDI.
+    Bu shim eskiden dokumanin TAMAMINI donduruyordu. Repodaki iki yaml
+    sekli var ve ikisi de kullanilir:
+
+      DUZ      teacher_hc_air.yaml / teacher_hc_air_3.yaml
+               -> en ustte dogrudan platform:, camera:, yaw: ...
+      SARMALI  fpv_gate.yaml / fpv_gate_2.yaml / fpv_gate_4.yaml / fpv_gate_5.yaml
+               -> en ustte image:, observation:, bridge:, hc_air:
+                  teacher parametreleri `hc_air:` ALTINDA
+
+    Sarmali dosyalarla simdiye kadar sorun cikmamasinin sebebi: hc_air_1.py
+    ve hc_air_4.py KENDI load_hc_air_config'ini tanimliyor ve orada acma
+    VAR. Bu shim'i import eden tek teacher hc_air_3 idi ve o DUZ dosya
+    okuyor -> acma eksikligi hic ortaya cikmadi.
+
+    hc_air_5 (arkadasin 9 Kas paketi) bu shim'i import ediyor AMA SARMALI
+    fpv_gate_5.yaml okuyor. Acma olmadan `cfg["platform"]` KeyError verir;
+    teacher daha ilk satirda coker. Upstream'in kendi hc_air_config'inde
+    bu acma ZATEN VAR (parents[3]/config/fpv_gate.yaml sarmali bir dosya) —
+    yani burada eksik olan upstream davranisiydi, yeni bir icat degil.
+
+    GERIYE UYUMLU: duz dosyalarda `hc_air` anahtari YOK, o yuzden onlar
+    aynen donmeye devam eder. acro_sender.py'nin `'acro' not in cfg`
+    kontrolu de etkilenmez (teacher_hc_air_3.yaml duz ve `acro:` en ustte).
+    """
     cfg_path = Path(path) if path is not None else _find_config()
     with cfg_path.open(encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+        raw = yaml.safe_load(f)
+    if isinstance(raw, dict) and "hc_air" in raw:
+        print(f"[HC_AIR] config yüklendi: {cfg_path}  (hc_air: bloğu açıldı)")
+        return raw["hc_air"]
     print(f"[HC_AIR] config yüklendi: {cfg_path}")
-    return cfg
+    return raw
 
 
 def cfg_float(cfg: dict[str, Any], key: str, default: float = 0.0) -> float:

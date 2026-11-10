@@ -26,6 +26,19 @@ FOLLOW DEVRİ (8 Ekim) — follow_gps takipçiyi GUIDED'da uçururken
               çıkarken LOITER'a ZORLAMAZ; eskisi saldırıyı ezerdi).
   Kumandadan moda aldıktan sonra (LOITER vb.) CH6 eskisi gibi çalışır.
 
+TAŞIMA SEÇİMİ (9 Kas 2026) — VARSAYILAN DEĞİŞMEDİ
+  (bayrak yok)            GUIDED_NOGPS + SET_ATTITUDE_TARGET  (guided_sender.py)
+  --acro                  ACRO + RC_CHANNELS_OVERRIDE         (acro_rc_sender.py)
+                          Arkadaşın 9 Kas paketi: hc_air_5 teacher'ı
+                          output_mode='acro_rc' ile kurulur, rate→PWM
+                          çevrimini TEACHER'IN İÇİNDEKİ HCAirAcroConverter
+                          yapar, bu katman sadece PWM'i taşır.
+  --action-units acro_pwm  ESKİ ACRO yolu (acro_sender.py). hc_air/hc_air_3
+                          rad/s verir, SENDER çevirir; dikey kanal
+                          guided_sender'ın sahada doğrulanmış yolundan geçer.
+                          İkisi AYNI ANDA verilemez — hangi çevrimin geçerli
+                          olduğu belirsiz kalmasın.
+
 ÇIKIŞ MODU
   --exit-mode stabilize   kapalı alan testi (GPS gerekmez)
   --exit-mode loiter      saha (GPS'li, olduğu yerde durur)
@@ -55,6 +68,16 @@ SAHA MERDİVENİ (kademeli yetki — her uçuşta tek değişken):
   python3 controller_guided.py --exit-mode loiter --enable-override \\
       --scale-roll 0 --scale-yaw 0.5 --scale-pitch 0.2 \\
       --scale-thrust 0.3 --max-rate 20 --thrust-dev 0.05
+
+ACRO MERDİVENİ (--acro, arkadaşın hc_air_5 paketi):
+  # A0 — PERVANESİZ bench: dikey yetki kapalı, gaz tavanlı, 20°/s zarf
+  python3 controller_guided.py --acro --teacher hc_air_5 \\
+      --acro-max-rate 20 --scale-thrust 0 --thrust-cap 0.20 \\
+      --exit-mode althold --enable-override
+  # A1 — masada override + release: CH6'yı aç-kapa, QGC'de CH1-4'ün
+  #      gidip GERİ DÖNDÜĞÜNÜ gör (release 0 gönderir, 65535 değil)
+  # Dry-run (hiçbir komut gönderilmez, teacher + çevrim yine koşar):
+  python3 controller_guided.py --acro --teacher hc_air_5 --exit-mode stabilize
 """
 
 import argparse
@@ -382,7 +405,27 @@ def main():
                         "hc_air_1/2/4 (tutum açısı, GUIDED + QUATERNION) | "
                         "acro_pwm = hc_air/hc_air_3 (gövde hızı, ACRO + "
                         "RC_CHANNELS_OVERRIDE — acro_sender.py)")
-    # --- ACRO YOLU (--action-units acro_pwm) ---
+    # --- YENI ACRO YOLU (9 Kas 2026) — arkadasin hc_air_5 paketi ---
+    p.add_argument('--acro', action='store_true',
+                   help="ACRO + RC_CHANNELS_OVERRIDE ile uc (acro_rc_sender.py). "
+                        "Teacher output_mode='acro_rc' ile kurulur: rate→PWM "
+                        "cevrimi TEACHER'IN ICINDE yapilir, bu katman sadece "
+                        "PWM tasir. output_mode destekleyen teacher'lar: "
+                        "hc_air_5 (arkadasin paketi) ve hc_air_3 (senin saha "
+                        "konfigin). Verilmezse varsayilan GUIDED_NOGPS + "
+                        "SET_ATTITUDE_TARGET (davranis DEGISMEZ). "
+                        "--action-units acro_pwm (eski ACRO yolu) ile "
+                        "BIRLIKTE verilemez.")
+    p.add_argument('--acro-accept-yaml-cal', action='store_true',
+                   help="--acro yolunda: rate/thrust→PWM konfigi FC'den "
+                        "OKUNAMAZSA canli ucusa yine izin ver. VARSAYILAN "
+                        "KESMEK. Sebep: fpv_gate_5.yaml SIM kalibrasyonu "
+                        "tasiyor; FC ile ayni degilse istedigin thrust ile "
+                        "giden thrust alakasiz olur (9 Kas olcumu: 0.101 "
+                        "isteyip 0.0002 gonderme). Bu bayragi ancak yaml'in "
+                        "FC ile birebir oldugunu DOGRULADIYSAN ver. "
+                        "Dry-run'da zaten kesmiyor.")
+    # --- ESKI ACRO YOLU (--action-units acro_pwm) ---
     p.add_argument('--acro-max-rate', type=float, default=None,
                    help="ACRO adapter fiziksel zarfını daraltır (deg/s). "
                         "--max-rate teacher KOMUTUNU kırpar, bu ADAPTER'i "
@@ -391,7 +434,10 @@ def main():
     p.add_argument('--acro-no-tilt-comp', action='store_true',
                    help="ACRO'da angle boost KAPALI olduğu için acro_sender "
                         "dikey telafiyi kendi ekler. Bu bayrak onu kapatır — "
-                        "SADECE PERVANESİZ BENCH.")
+                        "SADECE PERVANESİZ BENCH. NOT: sadece ESKİ yol "
+                        "(--action-units acro_pwm) için. --acro yolunda "
+                        "telafi teacher'ın içindedir (platform.tilt_cos_min), "
+                        "bu bayrak ETKİSİZDİR.")
     p.add_argument('--teacher-config', default=None,
                    help="Teacher YAML yolu (hc_air_1 için fpv_gate.yaml). "
                         "Verilmezse kcf/ içinde aranır.")
@@ -400,7 +446,12 @@ def main():
                    help="Otonomdan çıkınca dönülecek mod. VARSAYILAN=loiter (SAHA). "
                         "Kapalı alan testinde: --exit-mode stabilize")
     p.add_argument('--hover', type=float, default=None,
-                   help="MOT_THST_HOVER elle (verilmezse FC'den okunur)")
+                   help="MOT_THST_HOVER elle (verilmezse FC'den okunur). "
+                        "--acro yolunda AYRICA KRITIK: teacher'in dikey "
+                        "cikisi acro.hover_thrust_firmware'den gelir ve o "
+                        "deger FC'den OKUNMAZ. fpv_gate_5.yaml 0.33 tasiyor "
+                        "(sim degeri), olculmus hover 0.101-0.102 — arada "
+                        "~200 us gaz PWM farki var. --acro ile HER ZAMAN ver.")
     p.add_argument('--guid-timeout', type=float, default=0.5)
     p.add_argument('--rate-scale', type=float, default=1.0,
                    help="Tum rate komutlarini carpar (gimbal gozlem icin). "
@@ -490,6 +541,30 @@ def main():
         print(f"HATA: --thrust-dev {args.thrust_dev} gecersiz — >= 0 olmali")
         sys.exit(1)
 
+    # IKI ACRO YOLU AYNI ANDA OLMAZ. Ikisi de ACRO'ya gecip CH1-4'u override
+    # ediyor ama rate->PWM cevrimi FARKLI yerde ve dikey kanal BASKA egriden
+    # geciyor. Birlikte verilirse hangi cevrimin uctugu belirsiz kalirdi —
+    # tek degisken disiplini bunu kaldirmaz.
+    if args.acro and args.action_units == 'acro_pwm':
+        print("HATA: --acro (yeni yol, acro_rc_sender) ile "
+              "--action-units acro_pwm (eski yol, acro_sender) BIRLIKTE "
+              "verilemez.")
+        print("  --acro                   -> teacher PWM uretir "
+              "(hc_air_5, output_mode=acro_rc)")
+        print("  --action-units acro_pwm  -> teacher rad/s verir, sender cevirir "
+              "(hc_air / hc_air_3)")
+        print("  Birini sec.")
+        sys.exit(1)
+
+    # acro_rc_path : YENI yol (teacher PWM uretir) — 9 Kas 2026
+    # acro_path    : "ACRO modunda ucuyoruz" demek, IKI yolun da ortak bayragi.
+    #                Asagidaki TUM emniyet kancalari buna bakiyor ve degismedi:
+    #                auto_mode=ACRO, watchdog release-once-mod sirasi, 4. kapi
+    #                release'i, taban sigortasi release'i, finally release_burst.
+    # Banner bunlari bastigi icin BURADA, acilis ciktisindan ONCE hesaplanir.
+    acro_rc_path = bool(args.acro)
+    acro_path = acro_rc_path or (args.action_units == 'acro_pwm')
+
     dry_run = not args.enable_override
 
     # --gimbal ön ayarı: elle verilmemiş olanları doldurur (elle verilen kazanır)
@@ -502,7 +577,8 @@ def main():
             args.att_yaw_off_max = 15.0
 
     print("=" * 70)
-    print(" HUNTER — GUIDED_NOGPS KONTROLCÜSÜ")
+    print(" HUNTER — ACRO KONTROLCÜSÜ (--acro)" if acro_rc_path
+          else " HUNTER — GUIDED_NOGPS KONTROLCÜSÜ")
     print("=" * 70)
     print(" CH5=uçuş modu(FC) · CH6=otonom · CH8=pencere · CH12=kilit · CH13=boyut · CH11=arm")
     if args.follow_handover:
@@ -518,9 +594,16 @@ def main():
         print(" >>> (yine de unutursan Loiter reddedilir ve 0.7s'de stabilize'a düşer)")
     else:
         print(f" >>> KAPALI ALAN / ELLE SEÇİLDİ: {args.exit_mode.upper()}")
-    print(f" Aksiyon birimi: {args.action_units}"
-          + ("  → QUATERNION attitude-hold" if args.action_units == 'attitude_deg'
-             else "  → gövde rate"))
+    if acro_rc_path:
+        print(" Aksiyon birimi: acro_rc  → TAM SAYI RC PWM "
+              "(çevrim teacher'ın içinde)")
+        print(" NOT: --scale-roll/pitch/yaw bu yolda PWM uzayında çalışır "
+              "(expo yüzünden YAKLAŞIK).")
+        print("      Kesin rate tavanı için --acro-max-rate kullan.")
+    else:
+        print(f" Aksiyon birimi: {args.action_units}"
+              + ("  → QUATERNION attitude-hold" if args.action_units == 'attitude_deg'
+                 else "  → gövde rate"))
     print(" NOT: AUTO_*_DIR / AXIS_GAIN / RC_DZ bu yolda DEVREDE DEĞİL (RC baypas).")
     print(f" MOD: {'DRY-RUN (komut GÖNDERİLMİYOR)' if dry_run else '!!! KOMUT CANLI — PERVANESİZ !!!'}")
     print("=" * 70)
@@ -543,20 +626,36 @@ def main():
     # last_thrust) tasiyor. Bu yuzden asagidaki akisin GERI KALANI DEGISMEDI —
     # sadece hangi sinifin kuruldugu degisiyor. Governor bayraklari ayni
     # alanlardan okundugu icin ucuncu bir bayrak seridi OLUSMUYOR.
-    acro_path = (args.action_units == 'acro_pwm')
     if acro_path:
-        from acro_sender import AcroSender
         if args.att_roll_max is not None or args.att_pitch_max is not None \
                 or args.att_yaw_off_max is not None or args.gimbal:
             print("[!] --att-*-max / --gimbal ATTITUDE yoluna aittir, "
-                  "acro_pwm ile ETKISIZDIR. ACRO'da kelepce icin "
+                  "ACRO yolunda ETKISIZDIR. ACRO'da kelepce icin "
                   "--acro-max-rate ve --max-rate kullan.")
             sys.exit(1)
+    if acro_rc_path:
+        from acro_rc_sender import AcroRcSender
+        if args.acro_no_tilt_comp:
+            print("[!] --acro-no-tilt-comp SADECE eski ACRO yolu "
+                  "(--action-units acro_pwm) icindir. --acro yolunda tilt "
+                  "telafisi teacher'in icinde (platform.tilt_cos_min) ve "
+                  "buradan kapatilamaz.")
+            sys.exit(1)
+        SenderClass = AcroRcSender
+        sender_kw = dict(teacher=None,            # asagida doldurulur
+                         acro_max_rate_dps=args.acro_max_rate,
+                         accept_yaml_cal=args.acro_accept_yaml_cal)
+        print(" TASIMA: ACRO + RC_CHANNELS_OVERRIDE  (acro_rc_sender.py)")
+        print(" CEVRIM: TEACHER ICINDE (output_mode=acro_rc) — "
+              "arkadasin HCAirAcroConverter'i")
+    elif acro_path:
+        from acro_sender import AcroSender
         SenderClass = AcroSender
         sender_kw = dict(teacher_cfg=None,        # asagida doldurulur
                          acro_tilt_comp=not args.acro_no_tilt_comp,
                          acro_max_rate_dps=args.acro_max_rate)
-        print(" TASIMA: ACRO + RC_CHANNELS_OVERRIDE  (acro_sender.py)")
+        print(" TASIMA: ACRO + RC_CHANNELS_OVERRIDE  (acro_sender.py, ESKI yol)")
+        print(" CEVRIM: SENDER ICINDE — dikey kanal guided_sender yolundan")
     else:
         SenderClass = GuidedSender
         sender_kw = dict(att_roll_max=args.att_roll_max,
@@ -625,6 +724,10 @@ def main():
         'hc_air_2': ['fpv_gate_2.yaml'],                      # arkadasin aci
         'hc_air_3': ['teacher_hc_air_3.yaml'],                # YENI rate
         'hc_air_4': ['fpv_gate_4.yaml'],                      # YENI aci
+        # 9 Kas 2026 — arkadasin yeni paketi. Dosya SARMALI (en ustte image:,
+        # observation:, bridge:, hc_air:); hc_air_config shim'i `hc_air:`
+        # blogunu ACIYOR. `output:` ve `acro:` bloklari o blogun ICINDE.
+        'hc_air_5': ['fpv_gate_5.yaml'],                      # YENI rate + ACRO
     }
     teacher_cfg = args.teacher_config
     if teacher_cfg is None:
@@ -646,20 +749,58 @@ def main():
             print("[!] BASKA bir yaml'a DUSMUYORUM — 27 Agu 'sessizce yanlis "
                   "config' tuzagi bilerek kapatildi.")
             sys.exit(1)
+    # --acro: teacher'i output_mode='acro_rc' ile kur. Bu, arkadasin
+    # hc_air_5'inde cevrimi ACAN anahtar — HCAirAcroConverter o zaman
+    # kuruluyor ve compute_action TAM SAYI PWM donduruyor. Bayrak yaml'daki
+    # output.mode'u EZER, yani dosyada body_rate yazsa bile --acro ile
+    # acro_rc kosar (ve tersi: bayrak yoksa yaml ne diyorsa o).
+    teacher_kw = {}
+    if acro_rc_path:
+        teacher_kw['output_mode'] = 'acro_rc'
     try:
-        teacher = (TeacherClass(config_path=teacher_cfg) if teacher_cfg
-                   else TeacherClass())
+        teacher = (TeacherClass(config_path=teacher_cfg, **teacher_kw)
+                   if teacher_cfg else TeacherClass(**teacher_kw))
         if teacher_cfg:
             print(f"[CTRL] teacher config: {teacher_cfg}")
-    except TypeError:
+    except TypeError as e:
+        if acro_rc_path:
+            # SESSIZ DUSUS YASAK. config_path'siz yeniden denemek burada
+            # body_rate bir teacher uretirdi ve --acro verdigin halde
+            # GUIDED cikisi alirdin. Eski teacher'lar (hc_air, hc_air_1..4)
+            # output_mode kabul etmiyor — dogru teacher hc_air_5.
+            print(f"[!] '{args.teacher}' output_mode='acro_rc' KABUL ETMIYOR: {e}")
+            print("[!] --acro yolu output_mode destekleyen bir teacher ister. "
+                  "Su an ikisi var:")
+            print("[!]   --teacher hc_air_5  arkadasin 9 Kas paketi "
+                  "(fpv_gate_5.yaml)")
+            print("[!]   --teacher hc_air_3  SENIN saha konfigin "
+                  "(teacher_hc_air_3.yaml: rc 1045/1495/1945, "
+                  "hover_thrust_firmware 0.101, thr_mid 0.125)")
+            print("[!] hc_air / hc_air_1 / hc_air_2 / hc_air_4 output_mode "
+                  "bilmiyor; onlari ACRO'da ucurmak icin ESKI yol: "
+                  "--action-units acro_pwm")
+            sys.exit(1)
         teacher = TeacherClass()      # config_path kabul etmeyen teacher'lar
+    if acro_rc_path:
+        _om = getattr(teacher, 'output_mode', None)
+        if _om != 'acro_rc':
+            print(f"[!] teacher output_mode='{_om}' — 'acro_rc' bekleniyordu. "
+                  "PWM yerine rad/s uretirdi, ACRO'da bu YANLIS olcek. "
+                  "Baslatilmiyor.")
+            sys.exit(1)
+        print("[CTRL] teacher output_mode = acro_rc  → aksiyon TAM SAYI PWM")
     teacher.reset()
     print(f"[CTRL] Kontrolcü hazır: {args.teacher}.{TeacherClass.__name__}")
 
     # --- Sender kurulumu (teacher config COZULDUKTEN sonra) ---
     # AcroSender teacher_hc_air_3.yaml'in `acro:` blogunu okumak zorunda,
     # o yuzden kurulum buraya kadar bekletildi.
-    if acro_path:
+    if acro_rc_path:
+        # Cevrimi yapan converter TEACHER'IN ICINDE. Sender ayri bir adapter
+        # KURMAZ, teacher'inkini kullanir — tek dogruluk kaynagi. Bu yuzden
+        # teacher'in sender'dan ONCE kurulmus olmasi SART (yukarida oyle).
+        sender_kw['teacher'] = teacher
+    elif acro_path:
         sender_kw['teacher_cfg'] = teacher_cfg
     sender = SenderClass(fc.conn, fc.target_sys, fc.target_comp,
                          **_sender_common, **sender_kw)
@@ -898,11 +1039,22 @@ def main():
                     continue
 
                 sender.last_yaw_meas = fc.yaw_deg    # attitude modu yaw ofset siniri icin
-                sender.send(action, fc.roll_deg, fc.pitch_deg)
+                if acro_rc_path:
+                    # body=last_debug: action artik PWM, yani CSV'ye yazacak
+                    # gercek gövde komutu (rad/s + thrust) action'dan
+                    # OKUNAMAZ. Teacher onu last_debug'da body_*_cmd olarak
+                    # veriyor — cevrim ONCESI degerler. Olmasa sender
+                    # converter'in 'temsil edilen' rate'ine duser (kuantize,
+                    # yani komutun kendisi degil).
+                    sender.send(action, fc.roll_deg, fc.pitch_deg,
+                                body=teacher.last_debug)
+                else:
+                    sender.send(action, fc.roll_deg, fc.pitch_deg)
                 cmd = (sender.last_attitude if args.action_units == 'attitude_deg'
                        else sender.last_rates)
                 tag = ('guided_att' if args.action_units == 'attitude_deg'
-                       else ('acro' if acro_path else 'guided'))
+                       else ('acro_rc' if acro_rc_path
+                             else ('acro' if acro_path else 'guided')))
                 logger.log(tag if not dry_run else tag + '_dry', obs, action,
                            tuple(cmd) + (sender.last_thrust,))
             else:
@@ -938,6 +1090,25 @@ def main():
                               f"yaw={ay:+6.1f}° thrust={sender.last_thrust:.3f} "
                               f"| ang_x={bbox.get('ang_x',0):+.1f} "
                               f"ang_y={bbox.get('ang_y',0):+.1f}")
+                    elif acro_rc_path:
+                        pw = sender.last_pwm
+                        raw = sender.last_pwm_raw
+                        d = sender.debug()
+                        # r/pt/y burada TEACHER'in gövde komutu (cevrim
+                        # oncesi), pw ise gonderilen PWM. raw != pw ise
+                        # PWM governor'i kirpmis — gorunur olsun.
+                        _gov = "" if raw == pw else (
+                            f" (teacher R{raw[0]} P{raw[1]} T{raw[2]} Y{raw[3]})")
+                        print(f"             └─ rad/s [{r:+.3f} {pt:+.3f} {y:+.3f}] "
+                              f"thr={sender.last_thrust:+.3f} "
+                              f"→ PWM R{pw[0]} P{pw[1]} T{pw[2]} Y{pw[3]}{_gov} "
+                              f"| ang_x={bbox.get('ang_x',0):+.1f} "
+                              f"ang_y={bbox.get('ang_y',0):+.1f}")
+                        if d.get('acro_map_err', 0):
+                            print(f"             └─ !! ACRO map reddi: "
+                                  f"err={d['acro_map_err']:.0f} "
+                                  f"hold={d.get('acro_map_hold',0):.0f} "
+                                  f"neutral={d.get('acro_map_neutral',0):.0f}")
                     elif acro_path:
                         pw = sender.last_pwm
                         d = sender.debug()

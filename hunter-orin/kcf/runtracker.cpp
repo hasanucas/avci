@@ -307,6 +307,12 @@ static int         g_curKbps     = 0;         // encoder'da su an olan (g_gstMut
 static int         g_brMin       = 800;       // --br-min  (kbps)
 static int         g_brMax       = 5000;      // --br-max  (kbps)
 static int         g_chBitrate   = 0;         // --ch-bitrate N : pilot tavani (0 = kapali)
+// [9 KAS] --ch-lock N : MANUEL KILIT kanali (latching buton), 0 = kapali.
+// Sadece --hybrid-kcf modunda anlamli: buton ACIK -> aday kutu KCF'ye
+// devredilir ve YOLO DURUR; buton KAPALI -> kilit birakilir, YOLO yeniden
+// baslar. Kanal numarasi sabit degil cunku bos kanal kumandaya gore degisir
+// (--ch-bitrate ile ayni desen). Saha varsayilani CH9.
+static int         g_chLock      = 0;
 static std::string g_preset      = "superfast";   // --preset ultrafast|superfast|veryfast|faster
 static bool        g_mainProfile = false;     // --main    : cabac=1 + profile=main
 static bool        g_intraRefresh= true;      // --idr     : klasik IDR GOP'a don
@@ -756,6 +762,7 @@ struct RcControl {
     bool tracker_stop;  // CH12 (yayli slider): geri cek  -> birak
     int  resize_dir;    // CH13 (yayli slider): -1 kucult / +1 buyut (surekli), 0 yok
     int  bitrate_kbps;  // [EYLUL] --ch-bitrate N kanali: pilot tavani (kbps), -1 = yok
+    bool manual_lock;   // [9 KAS] --ch-lock N (latching): ACIK = kilitle+YOLO dur
 };
 
 void readRcControl(RcControl &ctrl)
@@ -766,19 +773,24 @@ void readRcControl(RcControl &ctrl)
     //   CH13 = ROI boyut         (yayli slider)
     //   CH5 ARTIK UCUS MODU KANALI (FLTMODE_CH=5) — tracker ASLA okumaz!
     //   CH9 bosta.
-    uint16_t ch8, ch12, ch13, chBr = 0;
+    uint16_t ch8, ch12, ch13, chBr = 0, chLk = 0;
     {
         std::lock_guard<std::mutex> lock(rcMutex);
         ch8  = rc_values[7];    // CH8  pencere
         ch12 = rc_values[11];   // CH12 kilit
         ch13 = rc_values[12];   // CH13 boyut
         if (g_chBitrate >= 1 && g_chBitrate <= 16) chBr = rc_values[g_chBitrate - 1];   // [EYLUL]
+        if (g_chLock    >= 1 && g_chLock    <= 16) chLk = rc_values[g_chLock    - 1];   // [9 KAS]
     }
     ctrl.bitrate_kbps = -1;     // [EYLUL] erken donus dahil her yolda tanimli
 
     // Pencere durumu (kalici) — GECERSIZ RC yolunda da dogru deger dönsün diye
     // korumadan ONCE tanimli olmali.
     static bool lastRoi = false;
+    // [9 KAS] Manuel kilit butonu da KALICI durum. GECERSIZ RC yolunda son
+    // degeri korumak ZORUNLU: 0 okunursa "pilot birakti" sanilip ucus ortasinda
+    // KILIT DUSERDI ve YOLO yeniden baslardi. CH8'in lastRoi mantigiyla ayni.
+    static bool lastLock = false;
 
     // GECERSIZ RC KORUMASI: RC gelmeden / dusunce degerler 0 olabilir.
     // Korumasiz kalirsa 0 degeri "geri cekildi" sanilip SAHTE BIRAK tetikler.
@@ -789,6 +801,7 @@ void readRcControl(RcControl &ctrl)
         ctrl.tracker_start = false;
         ctrl.tracker_stop  = false;
         ctrl.resize_dir    = 0;
+        ctrl.manual_lock   = lastLock;  // [9 KAS] kilit durumu da KORUNUR
         return;
     }
 
@@ -804,6 +817,20 @@ void readRcControl(RcControl &ctrl)
 
     ctrl.roi_visible = roi;
     lastRoi = roi;
+
+    // --- [9 KAS] Manuel kilit (--ch-lock N, latching buton) ---
+    // CH8 ile AYNI esikler: basili (>1600) ACIK, bos (<1350) KAPALI.
+    // Arada kalirsa son durum korunur (buton yolda titrerse kilit dusmesin).
+    // Kanal verilmediyse (g_chLock = 0) durum HEP false -> hicbir sey degismez.
+    bool lk = lastLock;
+    if (g_chLock >= 1 && chLk >= 900) {
+        if (chLk > 1600)      lk = true;
+        else if (chLk < 1350) lk = false;
+    } else if (g_chLock < 1) {
+        lk = false;
+    }
+    ctrl.manual_lock = lk;
+    lastLock = lk;
 
     // --- ROI boyut (CH13, yayli slider) --- MANTIK DEGISMEDI
     static uint16_t lastCh13 = 1500;
@@ -1476,6 +1503,12 @@ int main(int argc, char** argv)
             g_brMin = std::stoi(argv[++i]);
         } else if (!strcmp(argv[i], "--br-max") && i+1 < argc) {
             g_brMax = std::stoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--ch-lock") && i+1 < argc) {
+            // [9 KAS] manuel kilit kanali (orn. 9). Otomatik kilidi KAPATIR.
+            g_chLock = std::stoi(argv[++i]);
+            if (g_chLock >= 1 && g_chLock <= 16) g_lockCfg.manualOnly = true;
+        } else if (!strcmp(argv[i], "--lock-manual-min-hits") && i+1 < argc) {
+            g_lockCfg.manualMinHits = std::max(1, std::stoi(argv[++i]));
         } else if (!strcmp(argv[i], "--ch-bitrate") && i+1 < argc) {
             g_chBitrate = std::stoi(argv[++i]);   // pilot tavani kanali (orn. 9), 0 = kapali
         } else if (!strcmp(argv[i], "--rssi-bitrate")) {
@@ -1728,6 +1761,11 @@ int main(int argc, char** argv)
                 << "          [--preset superfast|veryfast|ultrafast] [--main] [--idr] [--udp-only]\n"
                 << "          [--br-min KBPS] [--br-max KBPS] [--ch-bitrate N] [--rssi-bitrate] [--auto-bitrate]\n"
                 << "  bitrate = min(RSSI katmani, RTCP onerisi, CHn tavani); hicbiri yoksa --bitrate sabit.\n"
+                << "  Manuel kilit ([9 KAS], sadece --hybrid-kcf):\n"
+                << "          [--ch-lock N]                CHN latching butonu: ACIK = adayi KCF'e devret\n"
+                << "                                       ve YOLO'yu DURDUR, KAPALI = birak, YOLO yeniden basla.\n"
+                << "                                       Otomatik 20/30 kilidi KAPATIR. Saha: CH9.\n"
+                << "          [--lock-manual-min-hits N]   butonla kilit icin asgari aday kaniti (vars. 3 kare)\n"
                 << "  Kucuk hedef ([KH]):\n"
                 << "          [--small-target]             x264 dct-decimate=0 fast-pskip=0 aq-strength=1.3\n"
                 << "          [--x264-opts \"a=1:b=0\"]      ek x264 ayari (deneme; orn. deadzone-inter=6:deadzone-intra=6)\n"
@@ -1845,7 +1883,29 @@ int main(int argc, char** argv)
         std::cout << "  min-box=" << g_ortMinBox
                   << "  min-score=" << g_ortMinScore << (g_ortMinScore > 0.0f ? "" : " (kapali)")
                   << "  lost-limit=" << g_ortLostLimit << "\n";
-        if (g_hybridKcf) {
+        if (g_hybridKcf && g_chLock >= 1) {
+            // [9 KAS] Pilot butonu acikken otomatik kilit KAPALI. Bunu
+            // acilista BASMAK zorunlu: aksi halde pilot "neden kendi
+            // kilitlemiyor" diye bekler, ya da tersine butonun islevsiz
+            // oldugunu fark etmez.
+            std::cout << "  kilit   : MANUEL — CH" << g_chLock
+                      << " latching butonu (otomatik 20/30 kilit KAPALI)\n"
+                      << "            buton ACIK  -> aday >=" << g_lockCfg.manualMinHits
+                      << " karede tutturmussa KCF'e devredilir, YOLO DURUR\n"
+                      << "            buton KAPALI-> kilit birakilir, YOLO yeniden baslar\n"
+                      << "            kilidi dusuren: " << g_lockCfg.invalidLimit
+                      << " gecersiz kare | " << g_lockCfg.outsideLimit
+                      << " kare guvenli alan disi";
+            if (g_lockCfg.presencePeriod > 0)
+                std::cout << " | varlik: " << g_lockCfg.presencePeriod << " karede 1, "
+                          << g_lockCfg.presenceMisses << " bos";
+            else
+                std::cout << " | varlik kontrolu KAPALI (sahte kilidi yakalayacak "
+                             "bagimsiz kontrol YOK — --kcf-presence-check N ile acilir)";
+            std::cout << "\n            buyume  : >=" << g_lockCfg.growthMinPx << "px iken x"
+                      << g_lockCfg.growthTrigger << " asilirsa x" << g_lockCfg.growthReset
+                      << "'e cekilir\n";
+        } else if (g_hybridKcf) {
             std::cout << "  kilit   : " << g_lockCfg.lockHits << "/" << g_lockCfg.lockWindow
                       << " tespit -> KCF kurulur, SONRA SADECE KCF (tespit durur)\n"
                       << "            kilidi dusuren: " << g_lockCfg.invalidLimit
@@ -2502,6 +2562,33 @@ int main(int argc, char** argv)
                     slk->onDetections(dets);
                 }
 
+                // 3b) [9 KAS] PILOT BUTONU (--ch-lock N, latching)
+                //
+                // Buton bir DURUM, kenar degil:
+                //   ACIK  + ARAMA -> aday yeterli kanita ulasinca KILITLE.
+                //                    Her karede denenir, yani "erken bastim"
+                //                    reddedilmek yerine "emin olunca kilitle"
+                //                    anlamina gelir.
+                //   ACIK  + KILIT -> dokunma (zaten kilitli, YOLO bosta).
+                //   KAPANDI       -> KENAR tetigi: kilidi birak, YOLO yeniden
+                //                    baslar. Surekli cagirmiyoruz cunku
+                //                    release() ARAMA'da adayi da siliyor;
+                //                    her karede cagirsak aday hic birikmezdi.
+                //
+                // Sira ONEMLI: bu blok onDetections'tan SONRA, pendingInit'ten
+                // ONCE. Boylece butonun kurdugu kilit AYNI karede KCF'e
+                // iniyor — bir kare gecikme yok.
+                if (g_chLock >= 1) {
+                    static bool lastBtn = false;
+                    const bool btn = rcCtrl.manual_lock;
+                    if (btn) {
+                        slk->forceLock();           // ice bakar, gerek yoksa no-op
+                    } else if (lastBtn && slk->state() == slock::State::LOCK) {
+                        slk->release("manual_release (buton birakildi)");
+                    }
+                    lastBtn = btn;
+                }
+
                 // 4) Kilit kurulacak mi (ilk kilit veya daha iyi hedefe gecis)
                 hybrid::BoxF ib{};
                 if (slk->pendingInit(ib)) slk->initDone(hybKcf->initialize(proc, ib));
@@ -2557,6 +2644,20 @@ int main(int argc, char** argv)
                     if (slk->clamps() > 0) b << "  clamp" << slk->clamps();
                 } else {
                     b << " " << slk->hits() << "/" << slk->window();
+                }
+                // [9 KAS] Buton durumu rozette. Pilot "bastim ama kilitlenmedi"
+                // durumunu GORMEK zorunda — sessiz kalirsa bastigini sanip
+                // CH6'yi acar.
+                if (g_chLock >= 1) {
+                    if (rcCtrl.manual_lock) {
+                        const char* why = slk->manualBlockReason();
+                        b << (why[0] ? "  [BTN bekliyor: " : "  [BTN");
+                        if (why[0]) b << why << "]";
+                        else        b << "]";
+                    } else {
+                        b << "  [btn kapali]";
+                    }
+                    if (slk->manualLocks() > 0) b << " m" << slk->manualLocks();
                 }
                 g_badge = b.str();
                 g_badgeActive = slk->hasBox();
