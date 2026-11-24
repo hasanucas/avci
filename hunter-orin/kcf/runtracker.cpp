@@ -2260,7 +2260,7 @@ int main(int argc, char** argv)
     // [PTR] Secim kutusu artik ptr::SelectBox'ta (merkez + boyut). Imlec hic
     // oynamadiysa kutu eski updateCenterRoi() ile BIREBIR ayni
     // (tests/test_roi_pointer.cpp "manuel uyum" bunu kilitliyor).
-    const float kSafeMarginRatio = 0.075f;     // (100-85)/2 — asagidaki guvenli alanla AYNI
+    const float kSafeMarginRatio = 0.05f;     // (100-85)/2 — asagidaki guvenli alanla AYNI
     ptr::SelectBox sel;
     int selW = procW, selH = procH;
     sel.setup(selW, selH, kSafeMarginRatio, roiBase, MIN_ROI_SIZE, MAX_ROI_SIZE, roiStep);
